@@ -65,7 +65,72 @@ struct Home {
   );
 });
 
-test("findDecoratedComponents identifies entry components and state members from struct declarations", () => {
+test("collectDiagnostics accepts common ArkTS decorators without intrinsic noise", () => {
+  const fileName = "/virtual/common-decorators.ets";
+  const analyzer = new ArkTSAnalyzer({
+    rootNames: [fileName],
+  });
+
+  analyzer.setInMemoryFile({
+    fileName,
+    content: `type Profile = { id: number };
+
+@Preview
+@Entry
+@Component
+struct Dashboard {
+  @State title: string = "hello";
+  @Prop subtitle: string = "subtitle";
+  @Link selectedId: number = 1;
+  @ObjectLink profile: Profile = { id: 1 };
+  @Provide providedCount: number = 1;
+  @Consume consumedCount: number = 0;
+  @StorageProp("token") token: string = "";
+  @StorageLink("loggedIn") loggedIn: boolean = false;
+  @LocalStorageProp("theme") theme: string = "light";
+  @LocalStorageLink("locale") locale: string = "en";
+  @BuilderParam renderHeader: () => void = () => {};
+  @Local localCount: number = 0;
+
+  @Watch("title")
+  onTitleChange(): void {
+    missingSymbol;
+  }
+
+  build() {}
+}
+`,
+  });
+
+  const diagnostics = analyzer.collectDiagnostics(fileName);
+
+  assert.ok(
+    diagnostics.some((diagnostic) =>
+      diagnostic.message.includes("Cannot find name 'missingSymbol'"),
+    ),
+  );
+  assert.ok(
+    diagnostics.every(
+      (diagnostic) =>
+        !diagnostic.message.includes("Cannot find name 'Preview'") &&
+        !diagnostic.message.includes("Cannot find name 'Prop'") &&
+        !diagnostic.message.includes("Cannot find name 'Link'") &&
+        !diagnostic.message.includes("Cannot find name 'ObjectLink'") &&
+        !diagnostic.message.includes("Cannot find name 'Provide'") &&
+        !diagnostic.message.includes("Cannot find name 'Consume'") &&
+        !diagnostic.message.includes("Cannot find name 'StorageProp'") &&
+        !diagnostic.message.includes("Cannot find name 'StorageLink'") &&
+        !diagnostic.message.includes("Cannot find name 'LocalStorageProp'") &&
+        !diagnostic.message.includes("Cannot find name 'LocalStorageLink'") &&
+        !diagnostic.message.includes("Cannot find name 'BuilderParam'") &&
+        !diagnostic.message.includes("Cannot find name 'Local'") &&
+        !diagnostic.message.includes("Cannot find name 'Watch'") &&
+        !diagnostic.message.includes("This expression is not callable"),
+    ),
+  );
+});
+
+test("findDecoratedComponents identifies core component decorators and decorated members", () => {
   const fileName = "/virtual/components.ets";
   const analyzer = new ArkTSAnalyzer({
     rootNames: [fileName],
@@ -73,15 +138,29 @@ test("findDecoratedComponents identifies entry components and state members from
 
   analyzer.setInMemoryFile({
     fileName,
-    content: `@Entry
+    content: `@Preview
+@Entry
 @Component
 struct Home {
   @State message: string = "hello";
+  @Prop title: string = "Home";
+  @StorageLink("loggedIn") loggedIn: boolean = false;
+
+  @Watch("message")
+  onMessageChange(): void {}
+
   build() {}
 }
 
+@Reusable
 @Component
 struct PlainComponent {
+  build() {}
+}
+
+@CustomDialog
+@Component
+struct DialogCard {
   build() {}
 }
 
@@ -93,14 +172,29 @@ class NonComponent {
 
   const components = analyzer.findDecoratedComponents(fileName);
 
-  assert.equal(components.length, 1);
-  assert.equal(components[0].name, "Home");
+  assert.equal(components.length, 3);
+  assert.deepEqual(
+    components.map((component) => component.name),
+    ["Home", "PlainComponent", "DialogCard"],
+  );
   assert.equal(components[0].isEntry, true);
-  assert.deepEqual(components[0].componentDecorators, ["Entry", "Component"]);
+  assert.deepEqual(components[0].componentDecorators, ["Preview", "Entry", "Component"]);
   assert.deepEqual(
     components[0].stateMembers.map((member) => member.name),
     ["message"],
   );
+  assert.deepEqual(
+    components[0].decoratedMembers.map((member) => `${member.name}:${member.decorator}:${member.kind}`),
+    [
+      "message:State:state",
+      "title:Prop:prop",
+      "loggedIn:StorageLink:storageLink",
+      "onMessageChange:Watch:other",
+    ],
+  );
+  assert.deepEqual(components[1].componentDecorators, ["Reusable", "Component"]);
+  assert.deepEqual(components[1].decoratedMembers, []);
+  assert.deepEqual(components[2].componentDecorators, ["CustomDialog", "Component"]);
 });
 
 test("findDefinition resolves local definitions, struct-backed members, aliases, and skips intrinsic decorators", () => {
@@ -169,6 +263,90 @@ struct Home {
     entryDecoratorPosition,
   );
   assert.equal(intrinsicDefinition, undefined);
+});
+
+test("hover, references, implementations, type definitions, and document symbols resolve through the language service", () => {
+  const entryFileName = "/virtual/main.ets";
+  const helperFileName = "/virtual/helper.ts";
+  const helperSource = `export interface Greeter {
+  greet(name: string): string;
+}
+
+export class ConsoleGreeter implements Greeter {
+  greet(name: string): string {
+    return name.toUpperCase();
+  }
+}
+
+export function useGreeter(greeter: Greeter): string {
+  return greeter.greet("Ada");
+}
+`;
+  const entrySource = `import { ConsoleGreeter, useGreeter, type Greeter } from "./helper.ts";
+
+@Entry
+@Component
+struct Home {
+  greeter: Greeter = new ConsoleGreeter();
+
+  build() {
+    const message = useGreeter(this.greeter);
+    return message;
+  }
+}
+`;
+  const analyzer = new ArkTSAnalyzer({
+    rootNames: [entryFileName, helperFileName],
+  });
+
+  analyzer.setInMemoryFile({
+    fileName: helperFileName,
+    content: helperSource,
+  });
+  analyzer.setInMemoryFile({
+    fileName: entryFileName,
+    content: entrySource,
+  });
+
+  const hover = analyzer.getHover(
+    entryFileName,
+    positionOf(analyzer, entryFileName, "useGreeter", "last"),
+  );
+  assert.match(hover?.displayText ?? "", /useGreeter\(greeter: Greeter\): string/);
+
+  const references = analyzer.findReferences(
+    entryFileName,
+    positionOf(analyzer, entryFileName, "useGreeter", "last"),
+  );
+  assert.ok(references.some((reference) =>
+    reference.fileName === helperFileName && reference.isDefinition
+  ));
+  assert.ok(references.some((reference) =>
+    reference.fileName === entryFileName && !reference.isDefinition
+  ));
+
+  const typeDefinitions = analyzer.findTypeDefinitions(
+    entryFileName,
+    positionOf(analyzer, entryFileName, "greeter", "last"),
+  );
+  assert.ok(typeDefinitions.some((location) =>
+    location.fileName === helperFileName && location.symbolName === "Greeter"
+  ));
+
+  const implementations = analyzer.findImplementations(
+    entryFileName,
+    positionOf(analyzer, entryFileName, "Greeter =", "first"),
+  );
+  assert.ok(implementations.some((location) =>
+    location.fileName === helperFileName && location.symbolName === "ConsoleGreeter"
+  ));
+
+  const documentSymbols = analyzer.getDocumentSymbols(entryFileName);
+  const homeSymbol =
+    documentSymbols.find((symbol) => symbol.name === "Home") ??
+    documentSymbols.flatMap((symbol) => symbol.children).find((symbol) => symbol.name === "Home");
+  assert.ok(homeSymbol);
+  assert.ok(homeSymbol.children.some((symbol) => symbol.name === "build"));
 });
 
 function positionOf(analyzer, fileName, text, occurrence) {

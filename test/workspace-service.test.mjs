@@ -52,11 +52,17 @@ test("WorkspaceService summarizes overlay content, returns related files, and re
         content: `import { Card } from "./Card.ets";
 import { greet } from "./utils/helper.ts";
 
+@Preview
 @Entry
 @Component
 struct App {
   @State count: number = 0;
+  @Prop subtitle: string = "hello";
   @State title: string = "hello";
+
+  @Watch("count")
+  onCountChange(): void {}
+
   build() {
     greet();
     const card = new Card();
@@ -71,6 +77,20 @@ struct App {
       overlaySummary.components[0]?.stateMembers.map((member) => member.name),
       ["count", "title"],
     );
+    assert.deepEqual(
+      overlaySummary.components[0]?.decoratedMembers.map((member) => ({
+        name: member.name,
+        decorator: member.decorator,
+        kind: member.kind,
+      })),
+      [
+        { name: "count", decorator: "State", kind: "state" },
+        { name: "subtitle", decorator: "Prop", kind: "prop" },
+        { name: "title", decorator: "State", kind: "state" },
+        { name: "onCountChange", decorator: "Watch", kind: "other" },
+      ],
+    );
+    assert.match(overlaySummary.summary, /recognized decorated member\(s\)/);
 
     const relatedFiles = await service.getRelatedFiles({
       targetFile: "src/App.ets",

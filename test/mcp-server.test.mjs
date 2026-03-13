@@ -16,11 +16,16 @@ test("MCP server lists the required ArkTS tools", async () => {
 
     assert.deepEqual(toolNames, [
       "arkts_analyze_components",
+      "arkts_document_symbols",
       "arkts_explain_module",
       "arkts_find_definition",
+      "arkts_find_implementation",
+      "arkts_find_references",
       "arkts_find_symbol",
+      "arkts_find_type_definition",
       "arkts_get_diagnostics",
       "arkts_get_related_files",
+      "arkts_hover",
       "arkts_refresh_workspace",
       "arkts_summarize_file",
       "arkts_trace_dependencies",
@@ -51,10 +56,16 @@ test("arkts_analyze_components resolves relative paths, honors overlays, and ret
           files: [
             {
               fileName: "main.ets",
-              content: `@Entry
+              content: `@Preview
+@Entry
 @Component
 struct Home {
   @State message: string = "hello";
+  @Prop title: string = "Greeting";
+
+  @Watch("message")
+  onMessageChange(): void {}
+
   build() {}
 }
 `,
@@ -68,10 +79,22 @@ struct Home {
       assert.equal(data.components.length, 1);
       assert.equal(data.components[0].name, "Home");
       assert.equal(data.components[0].fileName, expectedTargetFile);
-      assert.deepEqual(data.components[0].componentDecorators, ["Entry", "Component"]);
+      assert.deepEqual(data.components[0].componentDecorators, ["Preview", "Entry", "Component"]);
       assert.equal(data.components[0].stateMembers[0].name, "message");
+      assert.deepEqual(
+        data.components[0].decoratedMembers.map((member) => ({
+          name: member.name,
+          decorator: member.decorator,
+          kind: member.kind,
+        })),
+        [
+          { name: "message", decorator: "State", kind: "state" },
+          { name: "title", decorator: "Prop", kind: "prop" },
+          { name: "onMessageChange", decorator: "Watch", kind: "other" },
+        ],
+      );
       assert.deepEqual(data.components[0].stateMembers[0].range.start, {
-        line: 4,
+        line: 5,
         character: 3,
       });
     });
@@ -206,6 +229,77 @@ struct Home {
   });
 });
 
+test("arkts_get_diagnostics accepts common ArkTS decorator factories", async () => {
+  const source = `type Profile = { id: number };
+
+@Preview
+@Entry
+@Component
+struct Dashboard {
+  @State title: string = "hello";
+  @Prop subtitle: string = "subtitle";
+  @Link selectedId: number = 1;
+  @ObjectLink profile: Profile = { id: 1 };
+  @Provide providedCount: number = 1;
+  @Consume consumedCount: number = 0;
+  @StorageProp("token") token: string = "";
+  @StorageLink("loggedIn") loggedIn: boolean = false;
+  @LocalStorageProp("theme") theme: string = "light";
+  @LocalStorageLink("locale") locale: string = "en";
+  @BuilderParam renderHeader: () => void = () => {};
+  @Local localCount: number = 0;
+
+  @Watch("title")
+  onTitleChange(): void {
+    missingSymbol;
+  }
+
+  build() {}
+}
+`;
+
+  await withClient({}, async (client) => {
+    const result = await client.callTool({
+      name: "arkts_get_diagnostics",
+      arguments: {
+        targetFile: "virtual/common.ets",
+        files: [
+          {
+            fileName: "virtual/common.ets",
+            content: source,
+          },
+        ],
+      },
+    });
+    const data = getStructuredContent(result);
+
+    assert.ok(
+      data.diagnostics.some((diagnostic) =>
+        diagnostic.message.includes("Cannot find name 'missingSymbol'"),
+      ),
+    );
+    assert.ok(
+      data.diagnostics.every(
+        (diagnostic) =>
+          !diagnostic.message.includes("Cannot find name 'Preview'") &&
+          !diagnostic.message.includes("Cannot find name 'Prop'") &&
+          !diagnostic.message.includes("Cannot find name 'Link'") &&
+          !diagnostic.message.includes("Cannot find name 'ObjectLink'") &&
+          !diagnostic.message.includes("Cannot find name 'Provide'") &&
+          !diagnostic.message.includes("Cannot find name 'Consume'") &&
+          !diagnostic.message.includes("Cannot find name 'StorageProp'") &&
+          !diagnostic.message.includes("Cannot find name 'StorageLink'") &&
+          !diagnostic.message.includes("Cannot find name 'LocalStorageProp'") &&
+          !diagnostic.message.includes("Cannot find name 'LocalStorageLink'") &&
+          !diagnostic.message.includes("Cannot find name 'BuilderParam'") &&
+          !diagnostic.message.includes("Cannot find name 'Local'") &&
+          !diagnostic.message.includes("Cannot find name 'Watch'") &&
+          !diagnostic.message.includes("This expression is not callable"),
+      ),
+    );
+  });
+});
+
 test("arkts_find_definition resolves imported aliases and returns null for intrinsic decorators", async () => {
   const mainSource = `import { externalValue as aliasedValue } from "./helper.ts";
 
@@ -269,6 +363,88 @@ struct Home {
   });
 });
 
+test("language-service MCP tools return hover, references, implementations, type definitions, and document symbols", async () => {
+  const workspace = await createLanguageServiceWorkspaceFixture("arkts-mcp-language-service-");
+
+  try {
+    await withClient({}, async (client) => {
+      const hoverResult = await client.callTool({
+        name: "arkts_hover",
+        arguments: {
+          workspaceRoot: workspace.root,
+          targetFile: "src/App.ets",
+          position: positionOf(workspace.appSource, "useGreeter", "last"),
+        },
+      });
+      const hover = getStructuredContent(hoverResult);
+      assert.match(
+        hover.hover?.displayText ?? "",
+        /useGreeter\(greeter: Greeter\): string/,
+      );
+
+      const referencesResult = await client.callTool({
+        name: "arkts_find_references",
+        arguments: {
+          workspaceRoot: workspace.root,
+          targetFile: "src/App.ets",
+          position: positionOf(workspace.appSource, "useGreeter", "last"),
+        },
+      });
+      const references = getStructuredContent(referencesResult);
+      assert.ok(references.references.some((reference) =>
+        reference.fileName === workspace.helperFile && reference.isDefinition
+      ));
+      assert.ok(references.references.some((reference) =>
+        reference.fileName === workspace.appFile && !reference.isDefinition
+      ));
+
+      const implementationResult = await client.callTool({
+        name: "arkts_find_implementation",
+        arguments: {
+          workspaceRoot: workspace.root,
+          targetFile: "src/App.ets",
+          position: positionOf(workspace.appSource, "Greeter =", "first"),
+        },
+      });
+      const implementations = getStructuredContent(implementationResult);
+      assert.ok(implementations.locations.some((location) =>
+        location.fileName === workspace.helperFile && location.symbolName === "ConsoleGreeter"
+      ));
+
+      const typeDefinitionResult = await client.callTool({
+        name: "arkts_find_type_definition",
+        arguments: {
+          workspaceRoot: workspace.root,
+          targetFile: "src/App.ets",
+          position: positionOf(workspace.appSource, "greeter", "last"),
+        },
+      });
+      const typeDefinitions = getStructuredContent(typeDefinitionResult);
+      assert.ok(typeDefinitions.locations.some((location) =>
+        location.fileName === workspace.helperFile && location.symbolName === "Greeter"
+      ));
+
+      const documentSymbolsResult = await client.callTool({
+        name: "arkts_document_symbols",
+        arguments: {
+          workspaceRoot: workspace.root,
+          targetFile: "src/App.ets",
+        },
+      });
+      const symbols = getStructuredContent(documentSymbolsResult);
+      const homeSymbol =
+        symbols.symbols.find((symbol) => symbol.name === "Home") ??
+        symbols.symbols
+          .flatMap((symbol) => symbol.children)
+          .find((symbol) => symbol.name === "Home");
+      assert.ok(homeSymbol);
+      assert.ok(homeSymbol.children.some((symbol) => symbol.name === "build"));
+    });
+  } finally {
+    await rm(workspace.root, { recursive: true, force: true });
+  }
+});
+
 test("workspace MCP tools build repo maps, honor overlays, and refresh snapshots", async () => {
   const workspace = await createWorkspaceFixture("arkts-mcp-workspace-");
   const cacheDir = path.join(workspace.root, ".cache-test");
@@ -298,11 +474,17 @@ test("workspace MCP tools build repo maps, honor overlays, and refresh snapshots
               content: `import { Card } from "./Card.ets";
 import { greet } from "./utils/helper.ts";
 
+@Preview
 @Entry
 @Component
 struct App {
   @State count: number = 0;
+  @Prop subtitle: string = "overlay";
   @State title: string = "overlay";
+
+  @Watch("count")
+  onCountChange(): void {}
+
   build() {
     greet();
     const card = new Card();
@@ -319,6 +501,20 @@ struct App {
         summary.components[0].stateMembers.map((member) => member.name),
         ["count", "title"],
       );
+      assert.deepEqual(
+        summary.components[0].decoratedMembers.map((member) => ({
+          name: member.name,
+          decorator: member.decorator,
+          kind: member.kind,
+        })),
+        [
+          { name: "count", decorator: "State", kind: "state" },
+          { name: "subtitle", decorator: "Prop", kind: "prop" },
+          { name: "title", decorator: "State", kind: "state" },
+          { name: "onCountChange", decorator: "Watch", kind: "other" },
+        ],
+      );
+      assert.match(summary.summary, /recognized decorated member\(s\)/);
 
       const symbolResult = await client.callTool({
         name: "arkts_find_symbol",
@@ -525,5 +721,53 @@ export function greet(): number {
     cardFile,
     helperFile,
     barrelFile,
+  };
+}
+
+async function createLanguageServiceWorkspaceFixture(prefix) {
+  const createdRoot = await mkdtemp(path.join(os.tmpdir(), prefix));
+  const root = await realpath(createdRoot);
+  const srcDir = path.join(root, "src");
+  await mkdir(srcDir, { recursive: true });
+
+  const appFile = path.join(srcDir, "App.ets");
+  const helperFile = path.join(srcDir, "greeter.ts");
+  const helperSource = `export interface Greeter {
+  greet(name: string): string;
+}
+
+export class ConsoleGreeter implements Greeter {
+  greet(name: string): string {
+    return name.toUpperCase();
+  }
+}
+
+export function useGreeter(greeter: Greeter): string {
+  return greeter.greet("Ada");
+}
+`;
+  const appSource = `import { ConsoleGreeter, useGreeter, type Greeter } from "./greeter.ts";
+
+@Entry
+@Component
+struct Home {
+  greeter: Greeter = new ConsoleGreeter();
+
+  build() {
+    const message = useGreeter(this.greeter);
+    return message;
+  }
+}
+`;
+
+  await writeFile(appFile, appSource, "utf8");
+  await writeFile(helperFile, helperSource, "utf8");
+
+  return {
+    root,
+    appFile,
+    helperFile,
+    appSource,
+    helperSource,
   };
 }

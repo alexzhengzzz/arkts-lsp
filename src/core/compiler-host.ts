@@ -12,6 +12,11 @@ export interface ArkTSCompilerHostOptions {
   system?: ts.System;
 }
 
+export interface ArkTSLanguageServiceHostOptions extends ArkTSCompilerHostOptions {
+  versions?: ReadonlyMap<string, string>;
+  currentDirectory?: string;
+}
+
 export function createArkTSCompilerHost(
   compilerOptions: ts.CompilerOptions,
   options: ArkTSCompilerHostOptions = {},
@@ -97,10 +102,108 @@ export function createArkTSCompilerHost(
 
   return host;
 }
+
+export function createArkTSLanguageServiceHost(
+  rootNames: readonly string[],
+  compilerOptions: ts.CompilerOptions,
+  options: ArkTSLanguageServiceHostOptions = {},
+): ts.LanguageServiceHost {
+  const system = options.system ?? ts.sys;
+  const inMemoryFiles = options.inMemoryFiles ?? new Map<string, string>();
+  const versions = options.versions ?? new Map<string, string>();
+  const currentDirectory = options.currentDirectory ?? system.getCurrentDirectory();
+  const scriptFileNames = withArkTSIntrinsics(rootNames);
+  const host: ts.LanguageServiceHost = {
+    getCompilationSettings: () => compilerOptions,
+    getCurrentDirectory: () => currentDirectory,
+    getDefaultLibFileName: (settings) => ts.getDefaultLibFilePath(settings),
+    getScriptFileNames: () => [...scriptFileNames],
+    getScriptVersion: (fileName) => versions.get(fileName) ?? "0",
+    getScriptKind: (fileName) =>
+      isArkTSFile(fileName) || isArkTSIntrinsicFile(fileName)
+        ? ts.ScriptKind.TS
+        : inferScriptKind(fileName),
+    getScriptSnapshot: (fileName) => {
+      const sourceText = readSourceText(fileName, inMemoryFiles, system);
+      if (sourceText === undefined) {
+        return undefined;
+      }
+
+      return ts.ScriptSnapshot.fromString(sourceText);
+    },
+    fileExists: (fileName) =>
+      isArkTSIntrinsicFile(fileName) ||
+      inMemoryFiles.has(fileName) ||
+      system.fileExists(fileName),
+    readFile: (fileName) => readSourceText(fileName, inMemoryFiles, system),
+    directoryExists: (directoryName) =>
+      hasVirtualDirectory(inMemoryFiles, directoryName) ||
+      system.directoryExists?.(directoryName) ||
+      false,
+    getDirectories: (directoryName) => {
+      const systemDirectories = system.getDirectories?.(directoryName) ?? [];
+      const virtualDirectories = getVirtualDirectories(inMemoryFiles, directoryName);
+
+      return [...new Set([...systemDirectories, ...virtualDirectories])];
+    },
+    readDirectory: system.readDirectory?.bind(system),
+    useCaseSensitiveFileNames: () => system.useCaseSensitiveFileNames,
+  };
+
+  if (system.realpath) {
+    host.realpath = system.realpath.bind(system);
+  }
+
+  return host;
+}
+
 function getLanguageVersion(
   value: ts.ScriptTarget | ts.CreateSourceFileOptions,
 ): ts.ScriptTarget {
   return typeof value === "number" ? value : value.languageVersion;
+}
+
+function withArkTSIntrinsics(rootNames: readonly string[]): string[] {
+  return rootNames.includes(ARKTS_INTRINSICS_FILE_NAME)
+    ? [...rootNames]
+    : [...rootNames, ARKTS_INTRINSICS_FILE_NAME];
+}
+
+function readSourceText(
+  fileName: string,
+  inMemoryFiles: ReadonlyMap<string, string>,
+  system: ts.System,
+): string | undefined {
+  if (isArkTSIntrinsicFile(fileName)) {
+    return getArkTSIntrinsicsSource();
+  }
+
+  const sourceText = inMemoryFiles.get(fileName) ?? system.readFile(fileName);
+  if (sourceText === undefined) {
+    return undefined;
+  }
+
+  return normalizeArkTSSource(fileName, sourceText);
+}
+
+function inferScriptKind(fileName: string): ts.ScriptKind {
+  if (fileName.endsWith(".tsx")) {
+    return ts.ScriptKind.TSX;
+  }
+
+  if (fileName.endsWith(".jsx")) {
+    return ts.ScriptKind.JSX;
+  }
+
+  if (fileName.endsWith(".js") || fileName.endsWith(".mjs") || fileName.endsWith(".cjs")) {
+    return ts.ScriptKind.JS;
+  }
+
+  if (fileName.endsWith(".json")) {
+    return ts.ScriptKind.JSON;
+  }
+
+  return ts.ScriptKind.TS;
 }
 
 function hasVirtualDirectory(

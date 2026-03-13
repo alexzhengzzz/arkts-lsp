@@ -1,3 +1,4 @@
+import { type DefinitionLocation, type DocumentSymbol, type HoverInfo, type ReferenceLocation, type AnalyzerPosition } from "../core/arkts-analyzer.js";
 import type { ContextBundle, DependencyTrace, ExplainModuleResult, FileSummary, FindSymbolOptions, FindSymbolResult, RefreshResult, RelatedFilesOptions, TraceDependenciesOptions, WorkspaceOverview, WorkspaceOverlayFile, WorkspaceServiceOptions } from "./types.js";
 export declare class WorkspaceService {
     private readonly workspaceRoot;
@@ -20,11 +21,17 @@ export declare class WorkspaceService {
     findSymbol(query: string, options?: FindSymbolOptions): FindSymbolResult;
     getRelatedFiles(options: RelatedFilesOptions): Promise<ContextBundle>;
     explainModule(fileName: string, overlays?: WorkspaceOverlayFile[]): Promise<ExplainModuleResult>;
+    getHover(fileName: string, position: AnalyzerPosition, overlays?: WorkspaceOverlayFile[]): HoverInfo | undefined;
+    findReferences(fileName: string, position: AnalyzerPosition, overlays?: WorkspaceOverlayFile[]): ReferenceLocation[];
+    findImplementations(fileName: string, position: AnalyzerPosition, overlays?: WorkspaceOverlayFile[]): DefinitionLocation[];
+    findTypeDefinitions(fileName: string, position: AnalyzerPosition, overlays?: WorkspaceOverlayFile[]): DefinitionLocation[];
+    getDocumentSymbols(fileName: string, overlays?: WorkspaceOverlayFile[]): DocumentSymbol[];
     traceDependencies(options: TraceDependenciesOptions): Promise<DependencyTrace>;
     private loadOrBuildSnapshot;
     private rebuildSnapshot;
     private buildSnapshot;
     private createFileSummary;
+    private createAnalyzer;
     private persistSnapshot;
     private loadPersistedSnapshot;
     private createContextFile;

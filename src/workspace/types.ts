@@ -33,12 +33,35 @@ export interface StateMemberSummary {
   range: ExternalRange;
 }
 
+export type DecoratedMemberSummaryKind =
+  | "state"
+  | "prop"
+  | "link"
+  | "objectLink"
+  | "provide"
+  | "consume"
+  | "storageProp"
+  | "storageLink"
+  | "localStorageProp"
+  | "localStorageLink"
+  | "builderParam"
+  | "local"
+  | "other";
+
+export interface DecoratedMemberSummary {
+  name: string;
+  decorator: string;
+  kind: DecoratedMemberSummaryKind;
+  range: ExternalRange;
+}
+
 export interface ComponentSummary {
   name: string;
   range: ExternalRange;
   isEntry: boolean;
   componentDecorators: string[];
   stateMembers: StateMemberSummary[];
+  decoratedMembers: DecoratedMemberSummary[];
 }
 
 export interface ImportRecord {

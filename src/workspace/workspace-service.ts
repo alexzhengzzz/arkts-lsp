@@ -9,12 +9,18 @@ import ts from "typescript";
 import {
   ArkTSAnalyzer,
   type DecoratedComponentInfo,
+  type DefinitionLocation,
+  type DocumentSymbol,
+  type HoverInfo,
+  type ReferenceLocation,
+  type AnalyzerPosition,
 } from "../core/arkts-analyzer.js";
 import { ARKTS_INTRINSICS_FILE_NAME, isArkTSFile } from "../core/arkts-language.js";
 import type {
   ComponentSummary,
   ContextBundle,
   ContextFile,
+  DecoratedMemberSummary,
   DependencyTrace,
   DependencyTraceNode,
   ExplainModuleResult,
@@ -356,6 +362,55 @@ export class WorkspaceService {
     };
   }
 
+  public getHover(
+    fileName: string,
+    position: AnalyzerPosition,
+    overlays: WorkspaceOverlayFile[] = [],
+  ): HoverInfo | undefined {
+    const normalizedFileName = this.resolveWorkspacePath(fileName);
+    const analyzer = this.createAnalyzer(overlays, [normalizedFileName]);
+    return analyzer.getHover(normalizedFileName, position);
+  }
+
+  public findReferences(
+    fileName: string,
+    position: AnalyzerPosition,
+    overlays: WorkspaceOverlayFile[] = [],
+  ): ReferenceLocation[] {
+    const normalizedFileName = this.resolveWorkspacePath(fileName);
+    const analyzer = this.createAnalyzer(overlays, [normalizedFileName]);
+    return analyzer.findReferences(normalizedFileName, position);
+  }
+
+  public findImplementations(
+    fileName: string,
+    position: AnalyzerPosition,
+    overlays: WorkspaceOverlayFile[] = [],
+  ): DefinitionLocation[] {
+    const normalizedFileName = this.resolveWorkspacePath(fileName);
+    const analyzer = this.createAnalyzer(overlays, [normalizedFileName]);
+    return analyzer.findImplementations(normalizedFileName, position);
+  }
+
+  public findTypeDefinitions(
+    fileName: string,
+    position: AnalyzerPosition,
+    overlays: WorkspaceOverlayFile[] = [],
+  ): DefinitionLocation[] {
+    const normalizedFileName = this.resolveWorkspacePath(fileName);
+    const analyzer = this.createAnalyzer(overlays, [normalizedFileName]);
+    return analyzer.findTypeDefinitions(normalizedFileName, position);
+  }
+
+  public getDocumentSymbols(
+    fileName: string,
+    overlays: WorkspaceOverlayFile[] = [],
+  ): DocumentSymbol[] {
+    const normalizedFileName = this.resolveWorkspacePath(fileName);
+    const analyzer = this.createAnalyzer(overlays, [normalizedFileName]);
+    return analyzer.getDocumentSymbols(normalizedFileName);
+  }
+
   public async traceDependencies(
     options: TraceDependenciesOptions,
   ): Promise<DependencyTrace> {
@@ -569,6 +624,30 @@ export class WorkspaceService {
       topLevelSymbols: fileFacts.topLevelSymbols,
       components,
     };
+  }
+
+  private createAnalyzer(
+    overlays: WorkspaceOverlayFile[] = [],
+    extraFiles: string[] = [],
+  ): ArkTSAnalyzer {
+    const overlayMap = toOverlayMap(this.workspaceRoot, overlays);
+    const analysisFiles = dedupePaths([
+      ...this.discoveredFiles,
+      ...extraFiles.map((fileName) => this.resolveWorkspacePath(fileName)),
+      ...overlayMap.keys(),
+    ]);
+    const analyzer = new ArkTSAnalyzer({
+      rootNames: analysisFiles,
+    });
+
+    for (const [overlayFileName, content] of overlayMap.entries()) {
+      analyzer.setInMemoryFile({
+        fileName: overlayFileName,
+        content,
+      });
+    }
+
+    return analyzer;
   }
 
   private async persistSnapshot(): Promise<void> {
@@ -1101,9 +1180,17 @@ function createFileSummaryText(
   components: ComponentSummary[],
 ): string {
   const parts = [`${relativePath} is a ${role} file`];
+  const decoratedMemberCount = components.reduce(
+    (count, component) => count + component.decoratedMembers.length,
+    0,
+  );
 
   if (components.length > 0) {
     parts.push(`with ${components.length} ArkTS component(s)`);
+  }
+
+  if (decoratedMemberCount > 0) {
+    parts.push(`including ${decoratedMemberCount} recognized decorated member(s)`);
   }
 
   if (exports.length > 0) {
@@ -1174,6 +1261,18 @@ function toComponentSummary(component: DecoratedComponentInfo): ComponentSummary
       decorator: member.decorator,
       range: toExternalRangeFromAnalyzer(member.range),
     })),
+    decoratedMembers: component.decoratedMembers.map(toDecoratedMemberSummary),
+  };
+}
+
+function toDecoratedMemberSummary(
+  member: DecoratedComponentInfo["decoratedMembers"][number],
+): DecoratedMemberSummary {
+  return {
+    name: member.name,
+    decorator: member.decorator,
+    kind: member.kind,
+    range: toExternalRangeFromAnalyzer(member.range),
   };
 }
 

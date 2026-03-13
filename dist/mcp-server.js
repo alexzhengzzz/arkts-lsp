@@ -86,6 +86,26 @@ const componentOutputSchema = {
             decorator: z.string(),
             range: rangeSchema,
         })),
+        decoratedMembers: z.array(z.object({
+            name: z.string(),
+            decorator: z.string(),
+            kind: z.enum([
+                "state",
+                "prop",
+                "link",
+                "objectLink",
+                "provide",
+                "consume",
+                "storageProp",
+                "storageLink",
+                "localStorageProp",
+                "localStorageLink",
+                "builderParam",
+                "local",
+                "other",
+            ]),
+            range: rangeSchema,
+        })),
     })),
 };
 const componentSummarySchema = z.object({
@@ -96,6 +116,26 @@ const componentSummarySchema = z.object({
     stateMembers: z.array(z.object({
         name: z.string(),
         decorator: z.string(),
+        range: rangeSchema,
+    })),
+    decoratedMembers: z.array(z.object({
+        name: z.string(),
+        decorator: z.string(),
+        kind: z.enum([
+            "state",
+            "prop",
+            "link",
+            "objectLink",
+            "provide",
+            "consume",
+            "storageProp",
+            "storageLink",
+            "localStorageProp",
+            "localStorageLink",
+            "builderParam",
+            "local",
+            "other",
+        ]),
         range: rangeSchema,
     })),
 });
@@ -119,6 +159,58 @@ const definitionOutputSchema = {
         symbolName: z.string(),
     })
         .nullable(),
+};
+const hoverTagSchema = z.object({
+    name: z.string(),
+    text: z.string(),
+});
+const hoverOutputSchema = {
+    targetFile: z.string(),
+    queryPosition: positionSchema,
+    hover: z
+        .object({
+        fileName: z.string(),
+        range: rangeSchema,
+        symbolName: z.string(),
+        kind: z.string(),
+        kindModifiers: z.string(),
+        displayText: z.string(),
+        documentation: z.string(),
+        tags: z.array(hoverTagSchema),
+    })
+        .nullable(),
+};
+const referencesOutputSchema = {
+    targetFile: z.string(),
+    queryPosition: positionSchema,
+    references: z.array(z.object({
+        fileName: z.string(),
+        range: rangeSchema,
+        symbolName: z.string(),
+        isDefinition: z.boolean(),
+        isWriteAccess: z.boolean(),
+    })),
+};
+const locationListOutputSchema = {
+    targetFile: z.string(),
+    queryPosition: positionSchema,
+    locations: z.array(z.object({
+        fileName: z.string(),
+        range: rangeSchema,
+        symbolName: z.string(),
+    })),
+};
+const documentSymbolSchema = z.lazy(() => z.object({
+    name: z.string(),
+    kind: z.string(),
+    detail: z.string().optional(),
+    range: rangeSchema,
+    selectionRange: rangeSchema,
+    children: z.array(documentSymbolSchema),
+}));
+const documentSymbolsOutputSchema = {
+    targetFile: z.string(),
+    symbols: z.array(documentSymbolSchema),
 };
 const importRecordSchema = z.object({
     specifier: z.string(),
@@ -413,6 +505,184 @@ export function createArkTSMcpServer() {
             return toToolErrorResult(error);
         }
     });
+    server.registerTool("arkts_hover", {
+        title: "Get ArkTS Hover",
+        description: "Return type/signature/documentation information for the symbol at a 1-based position.",
+        inputSchema: {
+            ...workspaceScopedInputSchema,
+            targetFile: z.string().min(1),
+            position: positionSchema,
+        },
+        outputSchema: hoverOutputSchema,
+        annotations: {
+            readOnlyHint: true,
+        },
+    }, async (input) => {
+        try {
+            const service = await createWorkspaceService(input);
+            const hover = service.getHover(input.targetFile, toAnalyzerPosition(input.position), input.files);
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: hover === undefined
+                            ? `No hover information found at ${input.targetFile}:${input.position.line}:${input.position.character}.`
+                            : `Hover information for ${hover.symbolName} resolved from ${hover.fileName}.`,
+                    },
+                ],
+                structuredContent: toStructuredContent({
+                    targetFile: normalizeInputPath(input.targetFile),
+                    queryPosition: input.position,
+                    hover: hover ? toExternalHover(hover) : null,
+                }),
+            };
+        }
+        catch (error) {
+            return toToolErrorResult(error);
+        }
+    });
+    server.registerTool("arkts_find_references", {
+        title: "Find ArkTS References",
+        description: "Find workspace references for the symbol at a 1-based position.",
+        inputSchema: {
+            ...workspaceScopedInputSchema,
+            targetFile: z.string().min(1),
+            position: positionSchema,
+        },
+        outputSchema: referencesOutputSchema,
+        annotations: {
+            readOnlyHint: true,
+        },
+    }, async (input) => {
+        try {
+            const service = await createWorkspaceService(input);
+            const references = service.findReferences(input.targetFile, toAnalyzerPosition(input.position), input.files);
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: references.length === 0
+                            ? `No references found at ${input.targetFile}:${input.position.line}:${input.position.character}.`
+                            : `Found ${references.length} reference(s).`,
+                    },
+                ],
+                structuredContent: toStructuredContent({
+                    targetFile: normalizeInputPath(input.targetFile),
+                    queryPosition: input.position,
+                    references: references.map(toExternalReference),
+                }),
+            };
+        }
+        catch (error) {
+            return toToolErrorResult(error);
+        }
+    });
+    server.registerTool("arkts_find_implementation", {
+        title: "Find ArkTS Implementations",
+        description: "Find implementation locations for the symbol at a 1-based position.",
+        inputSchema: {
+            ...workspaceScopedInputSchema,
+            targetFile: z.string().min(1),
+            position: positionSchema,
+        },
+        outputSchema: locationListOutputSchema,
+        annotations: {
+            readOnlyHint: true,
+        },
+    }, async (input) => {
+        try {
+            const service = await createWorkspaceService(input);
+            const locations = service.findImplementations(input.targetFile, toAnalyzerPosition(input.position), input.files);
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: locations.length === 0
+                            ? `No implementations found at ${input.targetFile}:${input.position.line}:${input.position.character}.`
+                            : `Found ${locations.length} implementation location(s).`,
+                    },
+                ],
+                structuredContent: toStructuredContent({
+                    targetFile: normalizeInputPath(input.targetFile),
+                    queryPosition: input.position,
+                    locations: locations.map(toExternalDefinition),
+                }),
+            };
+        }
+        catch (error) {
+            return toToolErrorResult(error);
+        }
+    });
+    server.registerTool("arkts_find_type_definition", {
+        title: "Find ArkTS Type Definitions",
+        description: "Find type definition locations for the symbol at a 1-based position.",
+        inputSchema: {
+            ...workspaceScopedInputSchema,
+            targetFile: z.string().min(1),
+            position: positionSchema,
+        },
+        outputSchema: locationListOutputSchema,
+        annotations: {
+            readOnlyHint: true,
+        },
+    }, async (input) => {
+        try {
+            const service = await createWorkspaceService(input);
+            const locations = service.findTypeDefinitions(input.targetFile, toAnalyzerPosition(input.position), input.files);
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: locations.length === 0
+                            ? `No type definitions found at ${input.targetFile}:${input.position.line}:${input.position.character}.`
+                            : `Found ${locations.length} type definition location(s).`,
+                    },
+                ],
+                structuredContent: toStructuredContent({
+                    targetFile: normalizeInputPath(input.targetFile),
+                    queryPosition: input.position,
+                    locations: locations.map(toExternalDefinition),
+                }),
+            };
+        }
+        catch (error) {
+            return toToolErrorResult(error);
+        }
+    });
+    server.registerTool("arkts_document_symbols", {
+        title: "Get ArkTS Document Symbols",
+        description: "Return a hierarchical symbol tree for a target file.",
+        inputSchema: {
+            ...workspaceScopedInputSchema,
+            targetFile: z.string().min(1),
+        },
+        outputSchema: documentSymbolsOutputSchema,
+        annotations: {
+            readOnlyHint: true,
+        },
+    }, async (input) => {
+        try {
+            const service = await createWorkspaceService(input);
+            const symbols = service.getDocumentSymbols(input.targetFile, input.files);
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: symbols.length === 0
+                            ? `No document symbols found for ${input.targetFile}.`
+                            : `Found ${symbols.length} top-level document symbol(s).`,
+                    },
+                ],
+                structuredContent: toStructuredContent({
+                    targetFile: normalizeInputPath(input.targetFile),
+                    symbols: symbols.map(toExternalDocumentSymbol),
+                }),
+            };
+        }
+        catch (error) {
+            return toToolErrorResult(error);
+        }
+    });
     server.registerTool("arkts_refresh_workspace", {
         title: "Refresh Workspace Snapshot",
         description: "Invalidate and rebuild the persisted workspace snapshot, optionally tagging changed files in the response.",
@@ -627,6 +897,14 @@ function toExternalStateMember(stateMember) {
         range: toExternalRange(stateMember.range),
     };
 }
+function toExternalDecoratedMember(member) {
+    return {
+        name: member.name,
+        decorator: member.decorator,
+        kind: member.kind,
+        range: toExternalRange(member.range),
+    };
+}
 function toExternalComponent(component) {
     return {
         fileName: normalizeInputPath(component.fileName),
@@ -635,6 +913,7 @@ function toExternalComponent(component) {
         isEntry: component.isEntry,
         componentDecorators: component.componentDecorators,
         stateMembers: component.stateMembers.map(toExternalStateMember),
+        decoratedMembers: component.decoratedMembers.map(toExternalDecoratedMember),
     };
 }
 function toExternalDiagnostic(diagnostic) {
@@ -651,6 +930,43 @@ function toExternalDefinition(definition) {
         fileName: normalizeInputPath(definition.fileName),
         range: toExternalRange(definition.range),
         symbolName: definition.symbolName,
+    };
+}
+function toExternalHoverTag(tag) {
+    return {
+        name: tag.name,
+        text: tag.text,
+    };
+}
+function toExternalHover(hover) {
+    return {
+        fileName: normalizeInputPath(hover.fileName),
+        range: toExternalRange(hover.range),
+        symbolName: hover.symbolName,
+        kind: hover.kind,
+        kindModifiers: hover.kindModifiers,
+        displayText: hover.displayText,
+        documentation: hover.documentation,
+        tags: hover.tags.map(toExternalHoverTag),
+    };
+}
+function toExternalReference(reference) {
+    return {
+        fileName: normalizeInputPath(reference.fileName),
+        range: toExternalRange(reference.range),
+        symbolName: reference.symbolName,
+        isDefinition: reference.isDefinition,
+        isWriteAccess: reference.isWriteAccess,
+    };
+}
+function toExternalDocumentSymbol(symbol) {
+    return {
+        name: symbol.name,
+        kind: symbol.kind,
+        detail: symbol.detail,
+        range: toExternalRange(symbol.range),
+        selectionRange: toExternalRange(symbol.selectionRange),
+        children: symbol.children.map(toExternalDocumentSymbol),
     };
 }
 function toToolErrorResult(error) {

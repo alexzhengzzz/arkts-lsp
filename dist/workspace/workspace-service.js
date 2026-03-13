@@ -203,6 +203,31 @@ export class WorkspaceService {
             context,
         };
     }
+    getHover(fileName, position, overlays = []) {
+        const normalizedFileName = this.resolveWorkspacePath(fileName);
+        const analyzer = this.createAnalyzer(overlays, [normalizedFileName]);
+        return analyzer.getHover(normalizedFileName, position);
+    }
+    findReferences(fileName, position, overlays = []) {
+        const normalizedFileName = this.resolveWorkspacePath(fileName);
+        const analyzer = this.createAnalyzer(overlays, [normalizedFileName]);
+        return analyzer.findReferences(normalizedFileName, position);
+    }
+    findImplementations(fileName, position, overlays = []) {
+        const normalizedFileName = this.resolveWorkspacePath(fileName);
+        const analyzer = this.createAnalyzer(overlays, [normalizedFileName]);
+        return analyzer.findImplementations(normalizedFileName, position);
+    }
+    findTypeDefinitions(fileName, position, overlays = []) {
+        const normalizedFileName = this.resolveWorkspacePath(fileName);
+        const analyzer = this.createAnalyzer(overlays, [normalizedFileName]);
+        return analyzer.findTypeDefinitions(normalizedFileName, position);
+    }
+    getDocumentSymbols(fileName, overlays = []) {
+        const normalizedFileName = this.resolveWorkspacePath(fileName);
+        const analyzer = this.createAnalyzer(overlays, [normalizedFileName]);
+        return analyzer.getDocumentSymbols(normalizedFileName);
+    }
     async traceDependencies(options) {
         const snapshot = this.requireSnapshot();
         const targetFile = this.resolveTargetFile(options.targetFile, options.symbolQuery);
@@ -365,6 +390,24 @@ export class WorkspaceService {
             topLevelSymbols: fileFacts.topLevelSymbols,
             components,
         };
+    }
+    createAnalyzer(overlays = [], extraFiles = []) {
+        const overlayMap = toOverlayMap(this.workspaceRoot, overlays);
+        const analysisFiles = dedupePaths([
+            ...this.discoveredFiles,
+            ...extraFiles.map((fileName) => this.resolveWorkspacePath(fileName)),
+            ...overlayMap.keys(),
+        ]);
+        const analyzer = new ArkTSAnalyzer({
+            rootNames: analysisFiles,
+        });
+        for (const [overlayFileName, content] of overlayMap.entries()) {
+            analyzer.setInMemoryFile({
+                fileName: overlayFileName,
+                content,
+            });
+        }
+        return analyzer;
     }
     async persistSnapshot() {
         const snapshot = this.requireSnapshot();
@@ -764,8 +807,12 @@ function classifyFileRole(fileName, components, fileFacts) {
 }
 function createFileSummaryText(relativePath, role, exports, imports, components) {
     const parts = [`${relativePath} is a ${role} file`];
+    const decoratedMemberCount = components.reduce((count, component) => count + component.decoratedMembers.length, 0);
     if (components.length > 0) {
         parts.push(`with ${components.length} ArkTS component(s)`);
+    }
+    if (decoratedMemberCount > 0) {
+        parts.push(`including ${decoratedMemberCount} recognized decorated member(s)`);
     }
     if (exports.length > 0) {
         parts.push(`exporting ${exports.slice(0, 3).map((record) => record.name).join(", ")}`);
@@ -817,6 +864,15 @@ function toComponentSummary(component) {
             decorator: member.decorator,
             range: toExternalRangeFromAnalyzer(member.range),
         })),
+        decoratedMembers: component.decoratedMembers.map(toDecoratedMemberSummary),
+    };
+}
+function toDecoratedMemberSummary(member) {
+    return {
+        name: member.name,
+        decorator: member.decorator,
+        kind: member.kind,
+        range: toExternalRangeFromAnalyzer(member.range),
     };
 }
 function toExternalRangeFromAnalyzer(range) {
