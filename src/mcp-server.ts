@@ -15,6 +15,7 @@ import {
   type DefinitionLocation,
   type StateMemberInfo,
 } from "./core/arkts-analyzer.js";
+import { WorkspaceService } from "./workspace/workspace-service.js";
 
 interface WorkspaceFileInput {
   fileName: string;
@@ -29,6 +30,42 @@ interface WorkspaceToolInput {
 
 interface DefinitionToolInput extends WorkspaceToolInput {
   position: ExternalPosition;
+}
+
+interface WorkspaceServiceInput {
+  workspaceRoot?: string | undefined;
+  include?: string[] | undefined;
+  exclude?: string[] | undefined;
+  maxFiles?: number | undefined;
+  cacheDir?: string | undefined;
+  freshness?: "mtime" | "always" | undefined;
+}
+
+interface WorkspaceScopedToolInput extends WorkspaceServiceInput {
+  files?: WorkspaceFileInput[] | undefined;
+}
+
+interface WorkspaceFileToolInput extends WorkspaceScopedToolInput {
+  targetFile: string;
+}
+
+interface WorkspaceSymbolToolInput extends WorkspaceScopedToolInput {
+  query: string;
+  limit?: number | undefined;
+}
+
+interface RelatedFilesToolInput extends WorkspaceScopedToolInput {
+  targetFile?: string | undefined;
+  symbolQuery?: string | undefined;
+  limit?: number | undefined;
+}
+
+interface TraceDependenciesToolInput extends RelatedFilesToolInput {
+  depth?: number | undefined;
+}
+
+interface RefreshWorkspaceToolInput extends WorkspaceServiceInput {
+  changedFiles?: string[] | undefined;
 }
 
 interface ExternalPosition {
@@ -110,6 +147,45 @@ const workspaceInputSchema = {
     .describe("Optional in-memory file overlays. Later duplicates win."),
 } as const;
 
+const workspaceServiceInputSchema = {
+  workspaceRoot: z
+    .string()
+    .min(1)
+    .optional()
+    .describe("Workspace root path. Defaults to the current working directory."),
+  include: z
+    .array(z.string().min(1))
+    .optional()
+    .describe("Optional include globs for workspace discovery."),
+  exclude: z
+    .array(z.string().min(1))
+    .optional()
+    .describe("Optional exclude globs for workspace discovery."),
+  maxFiles: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe("Maximum number of workspace files to index."),
+  cacheDir: z
+    .string()
+    .min(1)
+    .optional()
+    .describe("Optional cache directory for persisted workspace snapshots."),
+  freshness: z
+    .enum(["mtime", "always"])
+    .optional()
+    .describe("Cache freshness policy. 'mtime' reuses cache until file metadata changes."),
+} as const;
+
+const workspaceScopedInputSchema = {
+  ...workspaceServiceInputSchema,
+  files: z
+    .array(workspaceFileSchema)
+    .optional()
+    .describe("Optional in-memory file overlays for query-time analysis."),
+} as const;
+
 const componentOutputSchema = {
   targetFile: z.string(),
   components: z.array(
@@ -129,6 +205,20 @@ const componentOutputSchema = {
     }),
   ),
 } as const;
+
+const componentSummarySchema = z.object({
+  name: z.string(),
+  range: rangeSchema,
+  isEntry: z.boolean(),
+  componentDecorators: z.array(z.string()),
+  stateMembers: z.array(
+    z.object({
+      name: z.string(),
+      decorator: z.string(),
+      range: rangeSchema,
+    }),
+  ),
+});
 
 const diagnosticsOutputSchema = {
   targetFile: z.string(),
@@ -155,8 +245,391 @@ const definitionOutputSchema = {
     .nullable(),
 } as const;
 
+const importRecordSchema = z.object({
+  specifier: z.string(),
+  resolvedPath: z.string().nullable(),
+  importedSymbols: z.array(z.string()),
+  kind: z.enum(["import", "re-export"]),
+  isTypeOnly: z.boolean(),
+});
+
+const exportRecordSchema = z.object({
+  name: z.string(),
+  kind: z.string(),
+  isDefault: z.boolean(),
+  sourcePath: z.string().nullable().optional(),
+});
+
+const topLevelSymbolSchema = z.object({
+  name: z.string(),
+  kind: z.string(),
+  range: rangeSchema,
+  exported: z.boolean(),
+});
+
+const fileSummarySchema = z.object({
+  fileName: z.string(),
+  relativePath: z.string(),
+  language: z.enum(["arkts", "typescript", "javascript"]),
+  role: z.enum(["entrypoint", "component", "module", "script"]),
+  summary: z.string(),
+  imports: z.array(importRecordSchema),
+  exports: z.array(exportRecordSchema),
+  topLevelSymbols: z.array(topLevelSymbolSchema),
+  components: z.array(componentSummarySchema),
+});
+
+const hotFileSchema = z.object({
+  fileName: z.string(),
+  relativePath: z.string(),
+  score: z.number().int(),
+});
+
+const workspaceOverviewOutputSchema = {
+  workspaceId: z.string(),
+  workspaceRoot: z.string(),
+  fileCount: z.number().int(),
+  symbolCount: z.number().int(),
+  edgeCount: z.number().int(),
+  truncated: z.boolean(),
+  entryFiles: z.array(z.string()),
+  hotFiles: z.array(hotFileSchema),
+  cacheStatus: z.enum(["memory", "hit", "rebuilt"]),
+  overview: z.string(),
+} as const;
+
+const findSymbolOutputSchema = {
+  query: z.string(),
+  matches: z.array(
+    z.object({
+      name: z.string(),
+      kind: z.string(),
+      fileName: z.string(),
+      relativePath: z.string(),
+      range: rangeSchema,
+      exported: z.boolean(),
+    }),
+  ),
+} as const;
+
+const contextBundleOutputSchema = {
+  rootFile: z.string(),
+  reason: z.string(),
+  files: z.array(
+    z.object({
+      fileName: z.string(),
+      relativePath: z.string(),
+      relation: z.enum(["self", "imports", "importedBy", "dependency"]),
+      reason: z.string(),
+      summary: z.string(),
+      snippet: z.string(),
+    }),
+  ),
+} as const;
+
+const explainModuleOutputSchema = {
+  file: fileSummarySchema,
+  context: z.object(contextBundleOutputSchema),
+} as const;
+
+const dependencyTraceOutputSchema = {
+  rootFile: z.string(),
+  depth: z.number().int(),
+  truncated: z.boolean(),
+  nodes: z.array(
+    z.object({
+      fileName: z.string(),
+      relativePath: z.string(),
+      role: z.enum(["entrypoint", "component", "module", "script"]),
+    }),
+  ),
+  edges: z.array(
+    z.object({
+      from: z.string(),
+      to: z.string(),
+      kind: z.enum(["import", "re-export"]),
+      specifier: z.string(),
+      symbols: z.array(z.string()),
+    }),
+  ),
+} as const;
+
+const refreshWorkspaceOutputSchema = {
+  workspaceId: z.string(),
+  refreshedFiles: z.array(z.string()),
+  fileCount: z.number().int(),
+  symbolCount: z.number().int(),
+  edgeCount: z.number().int(),
+  cacheStatus: z.enum(["memory", "hit", "rebuilt"]),
+} as const;
+
 export function createArkTSMcpServer(): McpServer {
   const server = new McpServer(serverInfo);
+
+  server.registerTool(
+    "arkts_workspace_overview",
+    {
+      title: "Get ArkTS Workspace Overview",
+      description:
+        "Build or load a workspace snapshot and return a bounded repo-map overview for LLM code reading.",
+      inputSchema: workspaceServiceInputSchema,
+      outputSchema: workspaceOverviewOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+      },
+    },
+    async (input: WorkspaceServiceInput) => {
+      try {
+        const service = await createWorkspaceService(input);
+        const overview = service.getOverview();
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: overview.overview,
+            },
+          ],
+          structuredContent: toStructuredContent(overview),
+        };
+      } catch (error) {
+        return toToolErrorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "arkts_summarize_file",
+    {
+      title: "Summarize ArkTS File",
+      description:
+        "Return a structured file summary with imports, exports, top-level symbols, and ArkTS component facts.",
+      inputSchema: {
+        ...workspaceScopedInputSchema,
+        targetFile: z.string().min(1),
+      },
+      outputSchema: fileSummarySchema.shape,
+      annotations: {
+        readOnlyHint: true,
+      },
+    },
+    async (input: WorkspaceFileToolInput) => {
+      try {
+        const service = await createWorkspaceService(input);
+        const file = await service.summarizeFile(input.targetFile, input.files);
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: file.summary,
+            },
+          ],
+          structuredContent: toStructuredContent(file),
+        };
+      } catch (error) {
+        return toToolErrorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "arkts_find_symbol",
+    {
+      title: "Find Workspace Symbol",
+      description:
+        "Search the workspace symbol index using a fuzzy symbol name query.",
+      inputSchema: {
+        ...workspaceServiceInputSchema,
+        query: z.string().min(1),
+        limit: z.number().int().positive().max(50).optional(),
+      },
+      outputSchema: findSymbolOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+      },
+    },
+    async (input: WorkspaceSymbolToolInput) => {
+      try {
+        const service = await createWorkspaceService(input);
+        const result = service.findSymbol(input.query, {
+          limit: input.limit,
+        });
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                result.matches.length === 0
+                  ? `No symbols matched "${input.query}".`
+                  : `Found ${result.matches.length} symbol match(es) for "${input.query}".`,
+            },
+          ],
+          structuredContent: toStructuredContent(result),
+        };
+      } catch (error) {
+        return toToolErrorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "arkts_get_related_files",
+    {
+      title: "Get Related Files",
+      description:
+        "Return a compact context bundle with the minimum related files around a target file or symbol query.",
+      inputSchema: {
+        ...workspaceScopedInputSchema,
+        targetFile: z.string().min(1).optional(),
+        symbolQuery: z.string().min(1).optional(),
+        limit: z.number().int().positive().max(20).optional(),
+      },
+      outputSchema: contextBundleOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+      },
+    },
+    async (input: RelatedFilesToolInput) => {
+      try {
+        const service = await createWorkspaceService(input);
+        const result = await service.getRelatedFiles({
+          targetFile: input.targetFile,
+          symbolQuery: input.symbolQuery,
+          limit: input.limit,
+        });
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Prepared ${result.files.length} related file(s) for contextual reading.`,
+            },
+          ],
+          structuredContent: toStructuredContent(result),
+        };
+      } catch (error) {
+        return toToolErrorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "arkts_explain_module",
+    {
+      title: "Explain ArkTS Module",
+      description:
+        "Return a file summary plus its local dependency neighborhood for quick module comprehension.",
+      inputSchema: {
+        ...workspaceScopedInputSchema,
+        targetFile: z.string().min(1),
+      },
+      outputSchema: explainModuleOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+      },
+    },
+    async (input: WorkspaceFileToolInput) => {
+      try {
+        const service = await createWorkspaceService(input);
+        const result = await service.explainModule(input.targetFile, input.files);
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: result.file.summary,
+            },
+          ],
+          structuredContent: toStructuredContent(result),
+        };
+      } catch (error) {
+        return toToolErrorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "arkts_trace_dependencies",
+    {
+      title: "Trace Dependencies",
+      description:
+        "Walk the local dependency graph from a target file or symbol and return a bounded graph slice.",
+      inputSchema: {
+        ...workspaceServiceInputSchema,
+        targetFile: z.string().min(1).optional(),
+        symbolQuery: z.string().min(1).optional(),
+        depth: z.number().int().positive().max(5).optional(),
+        limit: z.number().int().positive().max(100).optional(),
+      },
+      outputSchema: dependencyTraceOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+      },
+    },
+    async (input: TraceDependenciesToolInput) => {
+      try {
+        const service = await createWorkspaceService(input);
+        const result = await service.traceDependencies({
+          targetFile: input.targetFile,
+          symbolQuery: input.symbolQuery,
+          depth: input.depth,
+          limit: input.limit,
+        });
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                result.nodes.length === 0
+                  ? "Dependency trace produced no nodes."
+                  : `Dependency trace captured ${result.nodes.length} node(s) and ${result.edges.length} edge(s).`,
+            },
+          ],
+          structuredContent: toStructuredContent(result),
+        };
+      } catch (error) {
+        return toToolErrorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "arkts_refresh_workspace",
+    {
+      title: "Refresh Workspace Snapshot",
+      description:
+        "Invalidate and rebuild the persisted workspace snapshot, optionally tagging changed files in the response.",
+      inputSchema: {
+        ...workspaceServiceInputSchema,
+        changedFiles: z.array(z.string().min(1)).optional(),
+      },
+      outputSchema: refreshWorkspaceOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+      },
+    },
+    async (input: RefreshWorkspaceToolInput) => {
+      try {
+        const service = await createWorkspaceService(input);
+        const result = await service.refresh(input.changedFiles);
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Workspace snapshot refreshed for ${result.fileCount} indexed file(s).`,
+            },
+          ],
+          structuredContent: toStructuredContent(result),
+        };
+      } catch (error) {
+        return toToolErrorResult(error);
+      }
+    },
+  );
 
   server.registerTool(
     "arkts_analyze_components",
@@ -328,6 +801,21 @@ function createRequestContext(input: WorkspaceToolInput): RequestContext {
   };
 }
 
+async function createWorkspaceService(
+  input: WorkspaceServiceInput,
+): Promise<WorkspaceService> {
+  return WorkspaceService.initialize(
+    normalizeInputPath(input.workspaceRoot ?? process.cwd()),
+    {
+      include: input.include,
+      exclude: input.exclude,
+      maxFiles: input.maxFiles,
+      cacheDir: input.cacheDir,
+      freshness: input.freshness,
+    },
+  );
+}
+
 function collectOverlayEntries(
   files: WorkspaceFileInput[] | undefined,
 ): Array<[string, string]> {
@@ -427,6 +915,10 @@ function toToolErrorResult(error: unknown) {
     ],
     isError: true,
   };
+}
+
+function toStructuredContent<T>(value: T): Record<string, unknown> {
+  return value as unknown as Record<string, unknown>;
 }
 
 function isMainModule(): boolean {

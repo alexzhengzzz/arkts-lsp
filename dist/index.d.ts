@@ -1,2 +1,4 @@
 export { ArkTSAnalyzer } from "./core/arkts-analyzer.js";
+export { WorkspaceService } from "./workspace/workspace-service.js";
 export type { AnalyzeTextInput, AnalyzerDiagnostic, AnalyzerPosition, AnalyzerRange, ArkTSAnalyzerOptions, DecoratedComponentInfo, DefinitionLocation, StateMemberInfo, } from "./core/arkts-analyzer.js";
+export type { ComponentSummary, ContextBundle, ContextFile, DependencyTrace, DependencyTraceNode, ExplainModuleResult, ExportRecord, ExternalPosition, ExternalRange, FileSummary, FindSymbolOptions, FindSymbolResult, HotFileRecord, ImportRecord, ModuleEdge, RefreshResult, RelatedFilesOptions, StateMemberSummary, SymbolRecord, TopLevelSymbolSummary, TraceDependenciesOptions, WorkspaceCacheStatus, WorkspaceFileLanguage, WorkspaceFileRole, WorkspaceFreshness, WorkspaceOverview, WorkspaceOverlayFile, WorkspaceServiceOptions, WorkspaceSnapshot, } from "./workspace/types.js";

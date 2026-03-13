@@ -1,0 +1,34 @@
+import type { ContextBundle, DependencyTrace, ExplainModuleResult, FileSummary, FindSymbolOptions, FindSymbolResult, RefreshResult, RelatedFilesOptions, TraceDependenciesOptions, WorkspaceOverview, WorkspaceOverlayFile, WorkspaceServiceOptions } from "./types.js";
+export declare class WorkspaceService {
+    private readonly workspaceRoot;
+    private readonly options;
+    private static readonly sessions;
+    static initialize(root: string, options?: WorkspaceServiceOptions): Promise<WorkspaceService>;
+    static resetForTests(): void;
+    private readonly workspaceId;
+    private readonly optionsHash;
+    private readonly cacheFile;
+    private snapshot;
+    private fileStates;
+    private discoveredFiles;
+    private truncated;
+    private cacheStatus;
+    private constructor();
+    getOverview(): WorkspaceOverview;
+    refresh(changedFiles?: string[]): Promise<RefreshResult>;
+    summarizeFile(fileName: string, overlays?: WorkspaceOverlayFile[]): Promise<FileSummary>;
+    findSymbol(query: string, options?: FindSymbolOptions): FindSymbolResult;
+    getRelatedFiles(options: RelatedFilesOptions): Promise<ContextBundle>;
+    explainModule(fileName: string, overlays?: WorkspaceOverlayFile[]): Promise<ExplainModuleResult>;
+    traceDependencies(options: TraceDependenciesOptions): Promise<DependencyTrace>;
+    private loadOrBuildSnapshot;
+    private rebuildSnapshot;
+    private buildSnapshot;
+    private createFileSummary;
+    private persistSnapshot;
+    private loadPersistedSnapshot;
+    private createContextFile;
+    private resolveTargetFile;
+    private resolveWorkspacePath;
+    private requireSnapshot;
+}

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -16,8 +16,15 @@ test("MCP server lists the required ArkTS tools", async () => {
 
     assert.deepEqual(toolNames, [
       "arkts_analyze_components",
+      "arkts_explain_module",
       "arkts_find_definition",
+      "arkts_find_symbol",
       "arkts_get_diagnostics",
+      "arkts_get_related_files",
+      "arkts_refresh_workspace",
+      "arkts_summarize_file",
+      "arkts_trace_dependencies",
+      "arkts_workspace_overview",
     ]);
     assert.ok(result.tools.every((tool) => tool.annotations?.readOnlyHint === true));
   });
@@ -262,6 +269,132 @@ struct Home {
   });
 });
 
+test("workspace MCP tools build repo maps, honor overlays, and refresh snapshots", async () => {
+  const workspace = await createWorkspaceFixture("arkts-mcp-workspace-");
+  const cacheDir = path.join(workspace.root, ".cache-test");
+
+  try {
+    await withClient({}, async (client) => {
+      const overviewResult = await client.callTool({
+        name: "arkts_workspace_overview",
+        arguments: {
+          workspaceRoot: workspace.root,
+          cacheDir,
+        },
+      });
+      const overview = getStructuredContent(overviewResult);
+      assert.equal(overview.fileCount, 4);
+      assert.ok(overview.hotFiles.length <= 10);
+
+      const summaryResult = await client.callTool({
+        name: "arkts_summarize_file",
+        arguments: {
+          workspaceRoot: workspace.root,
+          cacheDir,
+          targetFile: "src/App.ets",
+          files: [
+            {
+              fileName: "src/App.ets",
+              content: `import { Card } from "./Card.ets";
+import { greet } from "./utils/helper.ts";
+
+@Entry
+@Component
+struct App {
+  @State count: number = 0;
+  @State title: string = "overlay";
+  build() {
+    greet();
+    const card = new Card();
+    return card;
+  }
+}
+`,
+            },
+          ],
+        },
+      });
+      const summary = getStructuredContent(summaryResult);
+      assert.deepEqual(
+        summary.components[0].stateMembers.map((member) => member.name),
+        ["count", "title"],
+      );
+
+      const symbolResult = await client.callTool({
+        name: "arkts_find_symbol",
+        arguments: {
+          workspaceRoot: workspace.root,
+          cacheDir,
+          query: "greet",
+        },
+      });
+      const symbols = getStructuredContent(symbolResult);
+      assert.ok(symbols.matches.some((match) => match.fileName === workspace.helperFile));
+
+      const relatedResult = await client.callTool({
+        name: "arkts_get_related_files",
+        arguments: {
+          workspaceRoot: workspace.root,
+          cacheDir,
+          targetFile: "src/App.ets",
+          limit: 4,
+        },
+      });
+      const related = getStructuredContent(relatedResult);
+      assert.equal(related.rootFile, workspace.appFile);
+      assert.ok(
+        related.files.some((file) => file.fileName === workspace.helperFile),
+      );
+
+      const traceResult = await client.callTool({
+        name: "arkts_trace_dependencies",
+        arguments: {
+          workspaceRoot: workspace.root,
+          cacheDir,
+          targetFile: "src/App.ets",
+          depth: 2,
+        },
+      });
+      const trace = getStructuredContent(traceResult);
+      assert.ok(trace.nodes.some((node) => node.fileName === workspace.appFile));
+      assert.ok(trace.edges.some((edge) => edge.to === workspace.helperFile));
+
+      await writeFile(
+        workspace.helperFile,
+        `export function renamedHelper(): string {
+  return "updated";
+}
+`,
+        "utf8",
+      );
+
+      const refreshResult = await client.callTool({
+        name: "arkts_refresh_workspace",
+        arguments: {
+          workspaceRoot: workspace.root,
+          cacheDir,
+          changedFiles: ["src/utils/helper.ts"],
+        },
+      });
+      const refresh = getStructuredContent(refreshResult);
+      assert.equal(refresh.fileCount, 4);
+
+      const refreshedSymbolResult = await client.callTool({
+        name: "arkts_find_symbol",
+        arguments: {
+          workspaceRoot: workspace.root,
+          cacheDir,
+          query: "renamedHelper",
+        },
+      });
+      const refreshedSymbols = getStructuredContent(refreshedSymbolResult);
+      assert.equal(refreshedSymbols.matches[0]?.fileName, workspace.helperFile);
+    });
+  } finally {
+    await rm(workspace.root, { recursive: true, force: true });
+  }
+});
+
 async function withClient(options, fn) {
   const stderr = [];
   const transport = new StdioClientTransport({
@@ -319,5 +452,78 @@ function positionOf(source, text, occurrence) {
   return {
     line,
     character: lastLine.length + 1,
+  };
+}
+
+async function createWorkspaceFixture(prefix) {
+  const createdRoot = await mkdtemp(path.join(os.tmpdir(), prefix));
+  const root = await realpath(createdRoot);
+  const srcDir = path.join(root, "src");
+  const utilsDir = path.join(srcDir, "utils");
+  const ignoredDir = path.join(root, "node_modules", "ignored");
+  await mkdir(utilsDir, { recursive: true });
+  await mkdir(ignoredDir, { recursive: true });
+
+  const appFile = path.join(srcDir, "App.ets");
+  const cardFile = path.join(srcDir, "Card.ets");
+  const helperFile = path.join(utilsDir, "helper.ts");
+  const barrelFile = path.join(srcDir, "barrel.ts");
+
+  await writeFile(
+    appFile,
+    `import { Card } from "./Card.ets";
+import { greet } from "./utils/helper.ts";
+
+@Entry
+@Component
+struct App {
+  @State count: number = 0;
+  build() {
+    greet();
+    const card = new Card();
+    return card;
+  }
+}
+`,
+    "utf8",
+  );
+  await writeFile(
+    cardFile,
+    `@Component
+export struct Card {
+  build() {}
+}
+`,
+    "utf8",
+  );
+  await writeFile(
+    helperFile,
+    `export const helperValue = 1;
+
+export function greet(): number {
+  return helperValue;
+}
+`,
+    "utf8",
+  );
+  await writeFile(
+    barrelFile,
+    `export { greet } from "./utils/helper.ts";
+`,
+    "utf8",
+  );
+  await writeFile(
+    path.join(ignoredDir, "index.ts"),
+    `export const ignored = true;
+`,
+    "utf8",
+  );
+
+  return {
+    root,
+    appFile,
+    cardFile,
+    helperFile,
+    barrelFile,
   };
 }
