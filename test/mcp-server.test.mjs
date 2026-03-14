@@ -939,6 +939,32 @@ test("workspace MCP startup args override repo config", async () => {
   }
 });
 
+test("workspace MCP ignores positional startup args and still resolves config from cwd", async () => {
+  const workspace = await createWorkspaceFixture("arkts-mcp-config-positional-");
+
+  try {
+    await writeMcpConfig(workspace.root, {
+      maxFiles: 1,
+    });
+
+    await withClient({
+      cwd: workspace.root,
+      serverArgs: ["/tmp/not-used-workspace"],
+    }, async (client) => {
+      const result = await client.callTool({
+        name: "arkts_workspace_overview",
+        arguments: {},
+      });
+      const overview = getStructuredContent(result);
+      assert.equal(overview.workspaceRoot, workspace.root);
+      assert.equal(overview.fileCount, 1);
+      assert.equal(overview.truncated, true);
+    });
+  } finally {
+    await rm(workspace.root, { recursive: true, force: true });
+  }
+});
+
 test("workspace MCP server fails fast for invalid config files", async () => {
   const cases = [
     {
@@ -1073,7 +1099,7 @@ test("workspace index CLI builds and refreshes a workspace snapshot", async () =
   try {
     const result = spawnSync(
       process.execPath,
-      [workspaceIndexScriptPath, workspace.root, "--json", "--verbose", "--max-files", "null"],
+      [workspaceIndexScriptPath, workspace.root, "--json", "--verbose"],
       {
         cwd: process.cwd(),
         encoding: "utf8",
@@ -1088,7 +1114,7 @@ test("workspace index CLI builds and refreshes a workspace snapshot", async () =
     assert.equal(typeof data.refreshMode, "string");
     assert.match(data.overview, /Workspace indexes 4 file\(s\)/);
     assert.match(result.stderr, /\[workspace:index\] Starting workspace index build/);
-    assert.match(result.stderr, /\[workspace:index\] Discovered 4 matching workspace files/);
+    assert.match(result.stderr, /\[workspace:index\] Discovered \d+ matching workspace files \(maxFiles=unlimited\)/);
     assert.match(result.stderr, /\[workspace:index\] Indexed 4\/4 files \(full\)/);
     assert.match(result.stderr, /\[workspace:index\] Refresh completed/);
   } finally {

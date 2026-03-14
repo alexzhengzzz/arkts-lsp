@@ -85,7 +85,7 @@ npm run verify:workspace-cache
 
 `start:mcp` 会通过 stdio 启动 `dist/mcp-server.js`，因此首次运行前需要先执行 `npm run build`。
 MCP 服务会在启动 `cwd` 下查找 `arkts-mcp.config.json`，并把该目录视为仓库根目录入口。
-`workspace:index` 会为目标目录执行一次工作区初始化并立刻 `refresh()`，用来快速触发全仓索引构建或增量刷新；默认目标目录是当前工作目录，也支持 `--json`、`--verbose`、`--cache-dir`、`--max-files`、`--freshness`。其中 `--verbose` 会把阶段日志、已发现文件数和索引进度输出到 `stderr`。
+`workspace:index` 会为目标目录执行一次工作区初始化并立刻 `refresh()`，用来快速触发全仓索引构建或增量刷新；默认目标目录是当前工作目录，也支持 `--json`、`--verbose`、`--cache-dir`、`--max-files`、`--freshness`。如果不传 `--max-files`，CLI 默认按 `null` 处理，也就是不设上限。其中 `--verbose` 会把阶段日志、已发现文件数和索引进度输出到 `stderr`。
 
 ## MCP 仓库配置
 

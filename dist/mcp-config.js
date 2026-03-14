@@ -79,7 +79,9 @@ function parseMcpServerArgs(argv) {
             index += 1;
             continue;
         }
-        throw new Error(`Unknown option: ${argument}`);
+        if (argument.startsWith("--")) {
+            throw new Error(`Unknown option: ${argument}`);
+        }
     }
     return options;
 }

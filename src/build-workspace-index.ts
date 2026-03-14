@@ -96,7 +96,7 @@ function parseArgs(args: string[]): CliOptions {
   let json = false;
   let help = false;
   let verbose = false;
-  let maxFiles: number | null | undefined;
+  let maxFiles: number | null = null;
   let cacheDir: string | undefined;
   let freshness: WorkspaceFreshness | undefined;
 
@@ -165,9 +165,7 @@ function parseArgs(args: string[]): CliOptions {
   if (cacheDir !== undefined) {
     serviceOptions.cacheDir = path.resolve(cacheDir);
   }
-  if (maxFiles !== undefined) {
-    serviceOptions.maxFiles = maxFiles;
-  }
+  serviceOptions.maxFiles = maxFiles;
   if (freshness !== undefined) {
     serviceOptions.freshness = freshness;
   }
@@ -201,7 +199,7 @@ Options:
   --json                     Print machine-readable JSON output.
   --verbose                  Print stage-level and file-count progress logs to stderr.
   --cache-dir <path>         Override the workspace snapshot cache directory.
-  --max-files <n|null>       Override maxFiles. Use "null" or "unlimited" for no cap.
+  --max-files <n|null>       Override maxFiles. Defaults to "null" (unlimited) when omitted.
   --freshness <mtime|always> Override cache freshness policy.
   --help, -h                 Show this help text.
 `);
