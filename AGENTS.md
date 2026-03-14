@@ -10,12 +10,14 @@ Use this order when it fits the task:
 2. `arkts_find_symbol`
 3. `arkts_summarize_file`
 4. `arkts_get_related_files`
-5. `arkts_explain_module`
-6. `arkts_trace_dependencies`
-7. `arkts_analyze_components`
-8. `arkts_get_diagnostics`
-9. `arkts_find_definition`
-10. `arkts_refresh_workspace` when files changed or cache looks stale
+5. `arkts_read_source_excerpt` when exact implementation details matter
+6. `arkts_get_evidence_context` when a conclusion needs source-backed proof
+7. `arkts_explain_module`
+8. `arkts_trace_dependencies`
+9. `arkts_analyze_components`
+10. `arkts_get_diagnostics`
+11. `arkts_find_definition`
+12. `arkts_refresh_workspace` when files changed or cache looks stale
 
 ## Repo Map
 
@@ -38,6 +40,7 @@ Use this order when it fits the task:
   - implementation work requires editing specific files
 - When using `arkts_find_definition`, remember the position is 1-based `line` and `character`.
 - When the user asks for a summary of a repo problem, first build repo context with MCP, then drill into a small number of files.
+- Treat `workspace_overview`, `summarize_file`, `get_related_files`, and `trace_dependencies` as valid analysis tools, but prefer `arkts_read_source_excerpt` or `arkts_get_evidence_context` before making precise implementation claims.
 
 ## Documentation Sync
 

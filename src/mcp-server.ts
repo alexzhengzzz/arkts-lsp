@@ -78,6 +78,22 @@ interface RefreshWorkspaceToolInput extends WorkspaceServiceInput {
   changedFiles?: string[] | undefined;
 }
 
+interface ReadSourceExcerptToolInput extends WorkspaceScopedToolInput {
+  targetFile: string;
+  range?: ExternalRange | undefined;
+  symbolQuery?: string | undefined;
+  maxLines?: number | undefined;
+}
+
+interface EvidenceContextToolInput extends WorkspaceScopedToolInput {
+  targetFile?: string | undefined;
+  symbolQuery?: string | undefined;
+  question?: string | undefined;
+  includeRelated?: boolean | undefined;
+  snippetCount?: number | undefined;
+  budgetChars?: number | undefined;
+}
+
 interface ExternalPosition {
   line: number;
   character: number;
@@ -179,6 +195,30 @@ interface ExternalDocumentSymbol {
   children: ExternalDocumentSymbol[];
 }
 
+interface ExternalSourceExcerpt {
+  fileName: string;
+  relativePath: string;
+  range: ExternalRange;
+  content: string;
+  truncated: boolean;
+  provenance: "snapshot" | "live";
+  evidenceLevel: "source";
+  symbolName?: string | undefined;
+  whySelected?: string | undefined;
+}
+
+interface ExternalEvidenceSnippet {
+  fileName: string;
+  relativePath: string;
+  range: ExternalRange;
+  content: string;
+  purpose: string;
+  truncated: boolean;
+  provenance: "snapshot" | "live";
+  evidenceLevel: "source";
+  whySelected?: string | undefined;
+}
+
 interface RequestContext {
   analyzer: ArkTSAnalyzer;
   targetFile: string;
@@ -198,6 +238,9 @@ const rangeSchema = z.object({
   start: positionSchema,
   end: positionSchema,
 });
+
+const provenanceSchema = z.enum(["snapshot", "live"]);
+const evidenceLevelSchema = z.enum(["summary", "source"]);
 
 const workspaceFileSchema = z.object({
   fileName: z.string().min(1).describe("Absolute or cwd-relative file path."),
@@ -466,6 +509,7 @@ const fileSummarySchema = z.object({
   relativePath: z.string(),
   language: z.enum(["arkts", "typescript", "javascript"]),
   role: z.enum(["entrypoint", "component", "module", "script"]),
+  provenance: provenanceSchema,
   summary: z.string(),
   imports: z.array(importRecordSchema),
   exports: z.array(exportRecordSchema),
@@ -489,6 +533,7 @@ const workspaceOverviewOutputSchema = {
   entryFiles: z.array(z.string()),
   hotFiles: z.array(hotFileSchema),
   cacheStatus: z.enum(["memory", "hit", "rebuilt"]),
+  provenance: provenanceSchema,
   overview: z.string(),
 } as const;
 
@@ -504,6 +549,7 @@ const findSymbolOutputSchema = {
       exported: z.boolean(),
     }),
   ),
+  provenance: provenanceSchema,
 } as const;
 
 const contextBundleOutputSchema = {
@@ -517,13 +563,20 @@ const contextBundleOutputSchema = {
       reason: z.string(),
       summary: z.string(),
       snippet: z.string(),
+      snippetRange: rangeSchema.optional(),
+      snippetTruncated: z.boolean().optional(),
+      provenance: provenanceSchema.optional(),
+      evidenceLevel: evidenceLevelSchema.optional(),
+      whySelected: z.string().optional(),
     }),
   ),
+  provenance: provenanceSchema,
 } as const;
 
 const explainModuleOutputSchema = {
   file: fileSummarySchema,
   context: z.object(contextBundleOutputSchema),
+  provenance: provenanceSchema,
 } as const;
 
 const dependencyTraceOutputSchema = {
@@ -546,6 +599,7 @@ const dependencyTraceOutputSchema = {
       symbols: z.array(z.string()),
     }),
   ),
+  provenance: provenanceSchema,
 } as const;
 
 const refreshWorkspaceOutputSchema = {
@@ -559,6 +613,43 @@ const refreshWorkspaceOutputSchema = {
   changedFileCount: z.number().int(),
   reindexedFileCount: z.number().int(),
   reusedFileCount: z.number().int(),
+  provenance: provenanceSchema,
+} as const;
+
+const sourceExcerptSchema: z.ZodType<ExternalSourceExcerpt> = z.object({
+  fileName: z.string(),
+  relativePath: z.string(),
+  range: rangeSchema,
+  content: z.string(),
+  truncated: z.boolean(),
+  provenance: provenanceSchema,
+  evidenceLevel: z.literal("source"),
+  symbolName: z.string().optional(),
+  whySelected: z.string().optional(),
+});
+
+const readSourceExcerptOutputSchema = {
+  targetFile: z.string(),
+  excerpt: sourceExcerptSchema,
+} as const;
+
+const evidenceSnippetSchema: z.ZodType<ExternalEvidenceSnippet> = z.object({
+  fileName: z.string(),
+  relativePath: z.string(),
+  range: rangeSchema,
+  content: z.string(),
+  purpose: z.string(),
+  truncated: z.boolean(),
+  provenance: provenanceSchema,
+  evidenceLevel: z.literal("source"),
+  whySelected: z.string().optional(),
+});
+
+const evidenceContextOutputSchema = {
+  rootFile: z.string(),
+  snippets: z.array(evidenceSnippetSchema),
+  truncated: z.boolean(),
+  provenance: provenanceSchema,
 } as const;
 
 export function createArkTSMcpServer(): McpServer {
@@ -693,10 +784,10 @@ export function createArkTSMcpServer(): McpServer {
       try {
         const service = await createWorkspaceService(input);
         const result = await service.getRelatedFiles({
-          targetFile: input.targetFile,
-          symbolQuery: input.symbolQuery,
-          limit: input.limit,
-        });
+          ...(input.targetFile ? { targetFile: input.targetFile } : {}),
+          ...(input.symbolQuery ? { symbolQuery: input.symbolQuery } : {}),
+          ...(input.limit !== undefined ? { limit: input.limit } : {}),
+        }, input.files);
 
         return {
           content: [
@@ -749,6 +840,100 @@ export function createArkTSMcpServer(): McpServer {
   );
 
   server.registerTool(
+    "arkts_read_source_excerpt",
+    {
+      title: "Read ArkTS Source Excerpt",
+      description:
+        "Return a precise source excerpt for a file range or symbol query with line-aware bounds.",
+      inputSchema: {
+        ...workspaceScopedInputSchema,
+        targetFile: z.string().min(1),
+        range: rangeSchema.optional(),
+        symbolQuery: z.string().min(1).optional(),
+        maxLines: z.number().int().positive().max(200).optional(),
+      },
+      outputSchema: readSourceExcerptOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+      },
+    },
+    async (input: ReadSourceExcerptToolInput) => {
+      try {
+        const service = await createWorkspaceService(input);
+        const result = await service.readSourceExcerpt({
+          targetFile: input.targetFile,
+          ...(input.range ? { range: input.range } : {}),
+          ...(input.symbolQuery ? { symbolQuery: input.symbolQuery } : {}),
+          ...(input.maxLines !== undefined ? { maxLines: input.maxLines } : {}),
+        }, input.files);
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                `Prepared source excerpt from ${result.excerpt.fileName}:${result.excerpt.range.start.line}:${result.excerpt.range.start.character}.`,
+            },
+          ],
+          structuredContent: toStructuredContent(result),
+        };
+      } catch (error) {
+        return toToolErrorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "arkts_get_evidence_context",
+    {
+      title: "Get ArkTS Evidence Context",
+      description:
+        "Return a bounded set of source-backed evidence snippets for high-confidence code understanding.",
+      inputSchema: {
+        ...workspaceScopedInputSchema,
+        targetFile: z.string().min(1).optional(),
+        symbolQuery: z.string().min(1).optional(),
+        question: z.string().min(1).optional(),
+        includeRelated: z.boolean().optional(),
+        snippetCount: z.number().int().positive().max(6).optional(),
+        budgetChars: z.number().int().positive().max(40000).optional(),
+      },
+      outputSchema: evidenceContextOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+      },
+    },
+    async (input: EvidenceContextToolInput) => {
+      try {
+        const service = await createWorkspaceService(input);
+        const result = await service.getEvidenceContext({
+          ...(input.targetFile ? { targetFile: input.targetFile } : {}),
+          ...(input.symbolQuery ? { symbolQuery: input.symbolQuery } : {}),
+          ...(input.question ? { question: input.question } : {}),
+          ...(input.includeRelated !== undefined ? { includeRelated: input.includeRelated } : {}),
+          ...(input.snippetCount !== undefined ? { snippetCount: input.snippetCount } : {}),
+          ...(input.budgetChars !== undefined ? { budgetChars: input.budgetChars } : {}),
+        }, input.files);
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                result.snippets.length === 0
+                  ? "No evidence snippets were produced."
+                  : `Prepared ${result.snippets.length} evidence snippet(s).`,
+            },
+          ],
+          structuredContent: toStructuredContent(result),
+        };
+      } catch (error) {
+        return toToolErrorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
     "arkts_trace_dependencies",
     {
       title: "Trace Dependencies",
@@ -770,10 +955,10 @@ export function createArkTSMcpServer(): McpServer {
       try {
         const service = await createWorkspaceService(input);
         const result = await service.traceDependencies({
-          targetFile: input.targetFile,
-          symbolQuery: input.symbolQuery,
-          depth: input.depth,
-          limit: input.limit,
+          ...(input.targetFile ? { targetFile: input.targetFile } : {}),
+          ...(input.symbolQuery ? { symbolQuery: input.symbolQuery } : {}),
+          ...(input.depth !== undefined ? { depth: input.depth } : {}),
+          ...(input.limit !== undefined ? { limit: input.limit } : {}),
         });
 
         return {

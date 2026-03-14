@@ -78,6 +78,7 @@ export class WorkspaceService {
             entryFiles: [...snapshot.entryFiles],
             hotFiles: [...snapshot.hotFiles],
             cacheStatus: this.cacheStatus,
+            provenance: "snapshot",
             overview: snapshot.overviewText,
         };
     }
@@ -147,7 +148,10 @@ export class WorkspaceService {
         if (overlayMap.size === 0) {
             const existing = snapshot.files.find((file) => file.fileName === normalizedFileName);
             if (existing) {
-                return existing;
+                return {
+                    ...existing,
+                    provenance: "snapshot",
+                };
             }
         }
         const analysisFiles = dedupePaths([
@@ -164,7 +168,7 @@ export class WorkspaceService {
                 content,
             });
         }
-        return this.createFileSummary(analyzer, normalizedFileName);
+        return this.createFileSummary(analyzer, normalizedFileName, overlayMap.has(normalizedFileName) ? "live" : "snapshot");
     }
     findSymbol(query, options = {}) {
         const snapshot = this.requireSnapshot();
@@ -182,36 +186,52 @@ export class WorkspaceService {
         return {
             query,
             matches,
+            provenance: "snapshot",
         };
     }
-    async getRelatedFiles(options) {
+    async getRelatedFiles(options, overlays = []) {
         const limit = clamp(options.limit ?? 6, 1, 20);
         const targetFile = this.resolveTargetFile(options.targetFile, options.symbolQuery);
-        const summary = this.filesByName.get(targetFile);
+        const overlayMap = toOverlayMap(this.workspaceRoot, overlays);
+        const summary = await this.getFileSummaryForPath(targetFile, overlayMap);
         if (!summary) {
             throw new Error(`Target file is not indexed in workspace: ${targetFile}`);
         }
         const outgoing = this.outgoingEdgesByFile.get(targetFile) ?? [];
         const incoming = this.incomingEdgesByFile.get(targetFile) ?? [];
         const rankedFiles = new Map();
-        rankedFiles.set(targetFile, await this.createContextFile(summary, "self", "Primary target file."));
+        rankedFiles.set(targetFile, await this.createContextFile(summary, "self", "Primary target file.", {
+            overlayMap,
+            ...(options.symbolQuery ? { symbolQuery: options.symbolQuery } : {}),
+            whySelected: options.symbolQuery
+                ? `Matched symbol query "${options.symbolQuery}" in the target file.`
+                : "Selected as the primary file for contextual reading.",
+        }));
         for (const edge of outgoing) {
-            const dependency = this.filesByName.get(edge.to);
+            const dependency = await this.getFileSummaryForPath(edge.to, overlayMap);
             if (!dependency || rankedFiles.has(dependency.fileName)) {
                 continue;
             }
-            rankedFiles.set(dependency.fileName, await this.createContextFile(dependency, "imports", `Imported via ${edge.specifier}.`));
+            rankedFiles.set(dependency.fileName, await this.createContextFile(dependency, "imports", `Imported via ${edge.specifier}.`, {
+                overlayMap,
+                specifier: edge.specifier,
+                whySelected: `Direct dependency imported from ${summary.relativePath}.`,
+            }));
             if (rankedFiles.size >= limit) {
                 break;
             }
         }
         if (rankedFiles.size < limit) {
             for (const edge of incoming) {
-                const importer = this.filesByName.get(edge.from);
+                const importer = await this.getFileSummaryForPath(edge.from, overlayMap);
                 if (!importer || rankedFiles.has(importer.fileName)) {
                     continue;
                 }
-                rankedFiles.set(importer.fileName, await this.createContextFile(importer, "importedBy", `Imports the target through ${edge.specifier}.`));
+                rankedFiles.set(importer.fileName, await this.createContextFile(importer, "importedBy", `Imports the target through ${edge.specifier}.`, {
+                    overlayMap,
+                    specifier: edge.specifier,
+                    whySelected: `Direct importer of ${summary.relativePath}.`,
+                }));
                 if (rankedFiles.size >= limit) {
                     break;
                 }
@@ -221,11 +241,15 @@ export class WorkspaceService {
             for (const edge of outgoing) {
                 const transitiveEdges = this.outgoingEdgesByFile.get(edge.to) ?? [];
                 for (const transitiveEdge of transitiveEdges) {
-                    const dependency = this.filesByName.get(transitiveEdge.to);
+                    const dependency = await this.getFileSummaryForPath(transitiveEdge.to, overlayMap);
                     if (!dependency || rankedFiles.has(dependency.fileName)) {
                         continue;
                     }
-                    rankedFiles.set(dependency.fileName, await this.createContextFile(dependency, "dependency", `Transitively required from ${summary.relativePath}.`));
+                    rankedFiles.set(dependency.fileName, await this.createContextFile(dependency, "dependency", `Transitively required from ${summary.relativePath}.`, {
+                        overlayMap,
+                        specifier: transitiveEdge.specifier,
+                        whySelected: `Transitive dependency reachable from ${summary.relativePath}.`,
+                    }));
                     if (rankedFiles.size >= limit) {
                         break;
                     }
@@ -241,6 +265,7 @@ export class WorkspaceService {
                 ? `Context bundle for symbol query "${options.symbolQuery}".`
                 : `Context bundle for ${summary.relativePath}.`,
             files: [...rankedFiles.values()].slice(0, limit),
+            provenance: overlayMap.size > 0 ? "live" : "snapshot",
         };
     }
     async explainModule(fileName, overlays = []) {
@@ -248,10 +273,11 @@ export class WorkspaceService {
         const context = await this.getRelatedFiles({
             targetFile: file.fileName,
             limit: 6,
-        });
+        }, overlays);
         return {
             file,
             context,
+            provenance: overlays.length > 0 ? "live" : "snapshot",
         };
     }
     getHover(fileName, position, overlays = []) {
@@ -278,6 +304,121 @@ export class WorkspaceService {
         const normalizedFileName = this.resolveWorkspacePath(fileName);
         const analyzer = this.getQueryAnalyzer(normalizedFileName, overlays);
         return analyzer.getDocumentSymbols(normalizedFileName);
+    }
+    async readSourceExcerpt(input, overlays = []) {
+        const normalizedFileName = this.resolveWorkspacePath(input.targetFile);
+        const maxLines = clamp(input.maxLines ?? 60, 1, 200);
+        const overlayMap = toOverlayMap(this.workspaceRoot, overlays);
+        const summary = await this.getFileSummaryForPath(normalizedFileName, overlayMap);
+        if (!summary) {
+            throw new Error(`Target file is not indexed in workspace: ${normalizedFileName}`);
+        }
+        const focusRange = input.range ?? this.findPreferredRange(summary, input.symbolQuery);
+        if (!focusRange) {
+            throw new Error("Either range or symbolQuery is required.");
+        }
+        const excerpt = await this.buildSourceExcerpt(summary, overlayMap, {
+            maxLines,
+            focusRange,
+            strictRange: input.range !== undefined,
+            contextBefore: input.range ? 0 : 3,
+            contextAfter: input.range ? 0 : 3,
+        }, {
+            ...(input.symbolQuery ? { symbolName: input.symbolQuery } : {}),
+            whySelected: input.range !== undefined
+                ? "Returned the explicitly requested source range."
+                : `Returned the source excerpt surrounding "${input.symbolQuery ?? "selection"}".`,
+        });
+        return {
+            targetFile: normalizedFileName,
+            excerpt,
+        };
+    }
+    async getEvidenceContext(options, overlays = []) {
+        const targetFile = this.resolveTargetFile(options.targetFile, options.symbolQuery);
+        const overlayMap = toOverlayMap(this.workspaceRoot, overlays);
+        const rootSummary = await this.getFileSummaryForPath(targetFile, overlayMap);
+        if (!rootSummary) {
+            throw new Error(`Target file is not indexed in workspace: ${targetFile}`);
+        }
+        const snippetCount = clamp(options.snippetCount ?? 4, 1, 6);
+        const budgetChars = clamp(options.budgetChars ?? 6000, 400, 40_000);
+        const includeRelated = options.includeRelated ?? true;
+        const candidates = await this.collectEvidenceCandidates({
+            rootSummary,
+            includeRelated,
+            overlayMap,
+            ...(options.symbolQuery ? { symbolQuery: options.symbolQuery } : {}),
+            ...(options.question ? { question: options.question } : {}),
+        });
+        const snippets = [];
+        const seen = new Set();
+        let consumedChars = 0;
+        let truncated = false;
+        for (const candidate of candidates) {
+            if (snippets.length >= snippetCount) {
+                truncated = true;
+                break;
+            }
+            const key = `${candidate.fileName}:${candidate.focusRange?.start.line ?? 0}:${candidate.purpose}`;
+            if (seen.has(key)) {
+                continue;
+            }
+            const summary = await this.getFileSummaryForPath(candidate.fileName, overlayMap);
+            if (!summary) {
+                continue;
+            }
+            const initialFocusRange = candidate.focusRange ?? this.findPreferredRange(summary, candidate.symbolName);
+            let excerpt = await this.buildSourceExcerpt(summary, overlayMap, {
+                maxLines: 40,
+                ...(initialFocusRange ? { focusRange: initialFocusRange } : {}),
+                contextBefore: 3,
+                contextAfter: 3,
+            }, {
+                ...(candidate.symbolName ? { symbolName: candidate.symbolName } : {}),
+                ...(candidate.whySelected ? { whySelected: candidate.whySelected } : {}),
+            });
+            const remainingBudget = budgetChars - consumedChars;
+            if (remainingBudget <= 0) {
+                truncated = true;
+                break;
+            }
+            if (excerpt.content.length > remainingBudget) {
+                if (snippets.length > 0) {
+                    truncated = true;
+                    continue;
+                }
+                const reducedFocusRange = candidate.focusRange ?? this.findPreferredRange(summary, candidate.symbolName);
+                excerpt = await this.buildSourceExcerpt(summary, overlayMap, {
+                    maxLines: clamp(Math.max(Math.floor(remainingBudget / 80), 6), 1, 40),
+                    ...(reducedFocusRange ? { focusRange: reducedFocusRange } : {}),
+                    contextBefore: 1,
+                    contextAfter: 1,
+                }, {
+                    ...(candidate.symbolName ? { symbolName: candidate.symbolName } : {}),
+                    ...(candidate.whySelected ? { whySelected: candidate.whySelected } : {}),
+                });
+            }
+            snippets.push({
+                fileName: excerpt.fileName,
+                relativePath: excerpt.relativePath,
+                range: excerpt.range,
+                content: excerpt.content,
+                purpose: candidate.purpose,
+                truncated: excerpt.truncated,
+                provenance: excerpt.provenance,
+                evidenceLevel: "source",
+                ...(candidate.whySelected ? { whySelected: candidate.whySelected } : {}),
+            });
+            consumedChars += excerpt.content.length;
+            seen.add(key);
+        }
+        return {
+            rootFile: rootSummary.fileName,
+            snippets,
+            truncated,
+            provenance: overlayMap.size > 0 ? "live" : "snapshot",
+        };
     }
     async traceDependencies(options) {
         const targetFile = this.resolveTargetFile(options.targetFile, options.symbolQuery);
@@ -329,6 +470,7 @@ export class WorkspaceService {
             truncated,
             nodes,
             edges,
+            provenance: "snapshot",
         };
     }
     async loadOrBuildSnapshot() {
@@ -419,6 +561,7 @@ export class WorkspaceService {
             changedFileCount: input.changedFileCount,
             reindexedFileCount: input.reindexedFileCount,
             reusedFileCount: input.reusedFileCount,
+            provenance: "snapshot",
         };
     }
     setSnapshot(snapshot) {
@@ -504,7 +647,7 @@ export class WorkspaceService {
         }
         return [...visited].sort((left, right) => left.localeCompare(right));
     }
-    createFileSummary(analyzer, fileName) {
+    createFileSummary(analyzer, fileName, provenance = "snapshot") {
         const sourceFile = analyzer.getSourceFile(fileName);
         if (!sourceFile) {
             throw new Error(`Unable to analyze file: ${fileName}`);
@@ -521,6 +664,7 @@ export class WorkspaceService {
             relativePath: normalizedRelativePath,
             language: detectWorkspaceLanguage(fileName),
             role,
+            provenance,
             summary: createFileSummaryText(normalizedRelativePath, role, fileFacts.exports, fileFacts.imports, components),
             imports: fileFacts.imports,
             exports: fileFacts.exports,
@@ -586,14 +730,25 @@ export class WorkspaceService {
             return null;
         }
     }
-    async createContextFile(summary, relation, reason) {
+    async createContextFile(summary, relation, reason, options = {}) {
+        const overlayMap = options.overlayMap ?? new Map();
+        const snippet = await this.readSummarySnippet(summary, overlayMap, {
+            maxLines: 20,
+            ...(options.symbolQuery ? { symbolQuery: options.symbolQuery } : {}),
+            ...(options.specifier ? { specifier: options.specifier } : {}),
+        });
         return {
             fileName: summary.fileName,
             relativePath: summary.relativePath,
             relation,
             reason,
             summary: summary.summary,
-            snippet: await readSnippet(summary.fileName),
+            snippet: snippet.content,
+            snippetRange: snippet.range,
+            snippetTruncated: snippet.truncated,
+            provenance: overlayMap.has(summary.fileName) ? "live" : "snapshot",
+            evidenceLevel: "summary",
+            ...(options.whySelected ? { whySelected: options.whySelected } : {}),
         };
     }
     resolveTargetFile(targetFile, symbolQuery) {
@@ -620,6 +775,154 @@ export class WorkspaceService {
         }
         return this.snapshot;
     }
+    async getFileSummaryForPath(fileName, overlayMap) {
+        if (overlayMap.has(fileName)) {
+            return this.summarizeFile(fileName, toOverlayFiles(overlayMap));
+        }
+        const summary = this.filesByName.get(fileName);
+        if (summary) {
+            return {
+                ...summary,
+                provenance: "snapshot",
+            };
+        }
+        if (this.discoveredFiles.includes(fileName)) {
+            return this.summarizeFile(fileName);
+        }
+        return undefined;
+    }
+    findPreferredRange(summary, symbolQuery) {
+        const normalizedQuery = symbolQuery?.trim().toLowerCase();
+        if (normalizedQuery) {
+            const topLevelMatch = summary.topLevelSymbols.find((symbol) => symbol.name.toLowerCase() === normalizedQuery) ?? summary.topLevelSymbols.find((symbol) => symbol.name.toLowerCase().includes(normalizedQuery));
+            if (topLevelMatch) {
+                return topLevelMatch.range;
+            }
+            const componentMatch = summary.components.find((component) => component.name.toLowerCase() === normalizedQuery) ?? summary.components.find((component) => component.name.toLowerCase().includes(normalizedQuery));
+            if (componentMatch) {
+                return componentMatch.range;
+            }
+        }
+        return summary.components[0]?.range ?? summary.topLevelSymbols[0]?.range;
+    }
+    async readSummarySnippet(summary, overlayMap, options) {
+        const text = await this.readWorkspaceText(summary.fileName, overlayMap);
+        if (text === undefined) {
+            return {
+                content: "",
+                range: {
+                    start: { line: 1, character: 1 },
+                    end: { line: 1, character: 1 },
+                },
+                truncated: false,
+            };
+        }
+        const focusRange = this.findPreferredRange(summary, options.symbolQuery) ??
+            findSpecifierRange(text, options.specifier) ??
+            summary.components[0]?.range ??
+            summary.topLevelSymbols[0]?.range;
+        return createSnippetPreviewFromText(text, {
+            maxLines: options.maxLines,
+            ...(focusRange ? { focusRange } : {}),
+            contextBefore: 2,
+            contextAfter: 2,
+        });
+    }
+    async buildSourceExcerpt(summary, overlayMap, options, meta = {}) {
+        const text = await this.readWorkspaceText(summary.fileName, overlayMap);
+        if (text === undefined) {
+            throw new Error(`Unable to read source for ${summary.fileName}.`);
+        }
+        const preview = createSnippetPreviewFromText(text, options);
+        return {
+            fileName: summary.fileName,
+            relativePath: summary.relativePath,
+            range: preview.range,
+            content: preview.content,
+            truncated: preview.truncated,
+            provenance: overlayMap.has(summary.fileName) ? "live" : summary.provenance,
+            evidenceLevel: "source",
+            ...(meta.symbolName ? { symbolName: meta.symbolName } : {}),
+            ...(meta.whySelected ? { whySelected: meta.whySelected } : {}),
+        };
+    }
+    async readWorkspaceText(fileName, overlayMap) {
+        if (overlayMap.has(fileName)) {
+            return overlayMap.get(fileName);
+        }
+        try {
+            return await readFile(fileName, "utf8");
+        }
+        catch {
+            return undefined;
+        }
+    }
+    async collectEvidenceCandidates(input) {
+        const candidates = [];
+        const rootRange = this.findPreferredRange(input.rootSummary, input.symbolQuery);
+        const rootSymbolName = input.symbolQuery;
+        candidates.push({
+            fileName: input.rootSummary.fileName,
+            purpose: rootSymbolName
+                ? `Target definition for ${rootSymbolName}`
+                : "Primary source excerpt for the target file",
+            priority: 0,
+            ...(rootRange ? { focusRange: rootRange } : {}),
+            ...(rootSymbolName ? { symbolName: rootSymbolName } : {}),
+            whySelected: rootSymbolName
+                ? `Primary definition candidate for "${rootSymbolName}".`
+                : input.question
+                    ? `Primary excerpt for answering: ${input.question}`
+                    : "Primary source evidence from the target file.",
+        });
+        if (rootRange && rootSymbolName) {
+            const analyzer = this.getQueryAnalyzer(input.rootSummary.fileName, toOverlayFiles(input.overlayMap));
+            const references = analyzer.findReferences(input.rootSummary.fileName, {
+                line: Math.max(rootRange.start.line - 1, 0),
+                character: Math.max(rootRange.start.character - 1, 0),
+            });
+            for (const reference of references.filter((candidate) => !candidate.isDefinition).slice(0, 2)) {
+                candidates.push({
+                    fileName: reference.fileName,
+                    purpose: `Direct reference to ${rootSymbolName}`,
+                    priority: 1,
+                    focusRange: toExternalRangeFromAnalyzer(reference.range),
+                    symbolName: rootSymbolName,
+                    whySelected: `Direct usage site for "${rootSymbolName}".`,
+                });
+            }
+        }
+        if (input.includeRelated) {
+            for (const edge of (this.outgoingEdgesByFile.get(input.rootSummary.fileName) ?? []).slice(0, 2)) {
+                candidates.push({
+                    fileName: edge.to,
+                    purpose: `Direct dependency imported via ${edge.specifier}`,
+                    priority: 2,
+                    ...(edge.symbols[0] ? { symbolName: edge.symbols[0] } : {}),
+                    whySelected: `Imported directly by ${input.rootSummary.relativePath}.`,
+                    specifier: edge.specifier,
+                });
+            }
+            for (const edge of (this.incomingEdgesByFile.get(input.rootSummary.fileName) ?? []).slice(0, 2)) {
+                candidates.push({
+                    fileName: edge.from,
+                    purpose: `Direct importer through ${edge.specifier}`,
+                    priority: 3,
+                    whySelected: `Imports ${input.rootSummary.relativePath} directly.`,
+                    specifier: edge.specifier,
+                });
+            }
+        }
+        return candidates.sort((left, right) => left.priority - right.priority ||
+            left.fileName.localeCompare(right.fileName) ||
+            left.purpose.localeCompare(right.purpose));
+    }
+}
+function toOverlayFiles(overlayMap) {
+    return [...overlayMap.entries()].map(([fileName, content]) => ({
+        fileName,
+        content,
+    }));
 }
 async function normalizeWorkspaceRoot(root) {
     const resolvedRoot = path.resolve(root);
@@ -1031,14 +1334,60 @@ function computeHotFiles(fileSummaries, moduleEdges) {
         .sort((left, right) => right.score - left.score || left.relativePath.localeCompare(right.relativePath))
         .slice(0, 10);
 }
-async function readSnippet(fileName, maxLines = 20) {
-    try {
-        const text = await readFile(fileName, "utf8");
-        return text.split(/\r?\n/u).slice(0, maxLines).join("\n");
+function createSnippetPreviewFromText(text, options) {
+    const lines = text.split(/\r?\n/u);
+    const totalLines = Math.max(lines.length, 1);
+    const focusStart = clamp(options.focusRange?.start.line ?? 1, 1, totalLines);
+    const focusEnd = clamp(options.focusRange?.end.line ?? focusStart, focusStart, totalLines);
+    const requestedLineCount = focusEnd - focusStart + 1;
+    const maxLines = clamp(options.maxLines, 1, 200);
+    let startLine = focusStart;
+    let endLine = focusEnd;
+    if (options.strictRange) {
+        endLine = Math.min(startLine + maxLines - 1, totalLines);
     }
-    catch {
-        return "";
+    else {
+        const contextBefore = options.contextBefore ?? 0;
+        const contextAfter = options.contextAfter ?? 0;
+        startLine = Math.max(focusStart - contextBefore, 1);
+        endLine = Math.min(Math.max(focusEnd + contextAfter, startLine) + Math.max(maxLines - requestedLineCount - contextBefore - contextAfter, 0), totalLines);
+        if (endLine - startLine + 1 > maxLines) {
+            endLine = startLine + maxLines - 1;
+        }
     }
+    const content = lines.slice(startLine - 1, endLine).join("\n");
+    const lastLineText = lines[endLine - 1] ?? "";
+    return {
+        content,
+        range: {
+            start: { line: startLine, character: 1 },
+            end: { line: endLine, character: lastLineText.length + 1 },
+        },
+        truncated: options.strictRange
+            ? requestedLineCount > maxLines
+            : startLine > 1 || endLine < totalLines,
+    };
+}
+function findSpecifierRange(text, specifier) {
+    if (!specifier) {
+        return undefined;
+    }
+    const lines = text.split(/\r?\n/u);
+    const lineIndex = lines.findIndex((line) => line.includes(specifier));
+    if (lineIndex === -1) {
+        return undefined;
+    }
+    const column = lines[lineIndex]?.indexOf(specifier) ?? 0;
+    return {
+        start: {
+            line: lineIndex + 1,
+            character: column + 1,
+        },
+        end: {
+            line: lineIndex + 1,
+            character: column + specifier.length + 1,
+        },
+    };
 }
 function toComponentSummary(component) {
     return {

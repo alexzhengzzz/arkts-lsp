@@ -10,6 +10,8 @@ export interface ExternalRange {
 
 export type WorkspaceFreshness = "mtime" | "always";
 export type WorkspaceCacheStatus = "memory" | "hit" | "rebuilt";
+export type WorkspaceProvenance = "snapshot" | "live";
+export type EvidenceLevel = "summary" | "source";
 export type WorkspaceFileLanguage = "arkts" | "typescript" | "javascript";
 export type WorkspaceFileRole = "entrypoint" | "component" | "module" | "script";
 export type ContextRelation = "self" | "imports" | "importedBy" | "dependency";
@@ -97,6 +99,7 @@ export interface FileSummary {
   relativePath: string;
   language: WorkspaceFileLanguage;
   role: WorkspaceFileRole;
+  provenance: WorkspaceProvenance;
   summary: string;
   imports: ImportRecord[];
   exports: ExportRecord[];
@@ -158,6 +161,7 @@ export interface WorkspaceOverview {
   entryFiles: string[];
   hotFiles: HotFileRecord[];
   cacheStatus: WorkspaceCacheStatus;
+  provenance: WorkspaceProvenance;
   overview: string;
 }
 
@@ -168,6 +172,7 @@ export interface FindSymbolOptions {
 export interface FindSymbolResult {
   query: string;
   matches: SymbolRecord[];
+  provenance: WorkspaceProvenance;
 }
 
 export interface ContextFile {
@@ -177,12 +182,18 @@ export interface ContextFile {
   reason: string;
   summary: string;
   snippet: string;
+  snippetRange?: ExternalRange;
+  snippetTruncated?: boolean;
+  provenance?: WorkspaceProvenance;
+  evidenceLevel?: EvidenceLevel;
+  whySelected?: string;
 }
 
 export interface ContextBundle {
   rootFile: string;
   reason: string;
   files: ContextFile[];
+  provenance: WorkspaceProvenance;
 }
 
 export interface RelatedFilesOptions {
@@ -194,6 +205,7 @@ export interface RelatedFilesOptions {
 export interface ExplainModuleResult {
   file: FileSummary;
   context: ContextBundle;
+  provenance: WorkspaceProvenance;
 }
 
 export interface TraceDependenciesOptions {
@@ -215,6 +227,7 @@ export interface DependencyTrace {
   truncated: boolean;
   nodes: DependencyTraceNode[];
   edges: ModuleEdge[];
+  provenance: WorkspaceProvenance;
 }
 
 export interface RefreshResult {
@@ -228,4 +241,41 @@ export interface RefreshResult {
   changedFileCount: number;
   reindexedFileCount: number;
   reusedFileCount: number;
+  provenance: WorkspaceProvenance;
+}
+
+export interface SourceExcerpt {
+  fileName: string;
+  relativePath: string;
+  range: ExternalRange;
+  content: string;
+  truncated: boolean;
+  provenance: WorkspaceProvenance;
+  evidenceLevel: EvidenceLevel;
+  symbolName?: string;
+  whySelected?: string;
+}
+
+export interface ReadSourceExcerptResult {
+  targetFile: string;
+  excerpt: SourceExcerpt;
+}
+
+export interface EvidenceSnippet {
+  fileName: string;
+  relativePath: string;
+  range: ExternalRange;
+  content: string;
+  purpose: string;
+  truncated: boolean;
+  provenance: WorkspaceProvenance;
+  evidenceLevel: EvidenceLevel;
+  whySelected?: string;
+}
+
+export interface EvidenceContextResult {
+  rootFile: string;
+  snippets: EvidenceSnippet[];
+  truncated: boolean;
+  provenance: WorkspaceProvenance;
 }

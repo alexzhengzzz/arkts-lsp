@@ -24,8 +24,10 @@ test("MCP server lists the required ArkTS tools", async () => {
       "arkts_find_symbol",
       "arkts_find_type_definition",
       "arkts_get_diagnostics",
+      "arkts_get_evidence_context",
       "arkts_get_related_files",
       "arkts_hover",
+      "arkts_read_source_excerpt",
       "arkts_refresh_workspace",
       "arkts_summarize_file",
       "arkts_trace_dependencies",
@@ -682,9 +684,96 @@ struct App {
       });
       const related = getStructuredContent(relatedResult);
       assert.equal(related.rootFile, workspace.appFile);
+      assert.equal(related.provenance, "snapshot");
       assert.ok(
         related.files.some((file) => file.fileName === workspace.helperFile),
       );
+      assert.ok(
+        related.files.every((file) =>
+          typeof file.snippet === "string" &&
+          typeof file.snippetTruncated === "boolean" &&
+          file.provenance &&
+          file.evidenceLevel === "summary" &&
+          file.snippetRange
+        ),
+      );
+
+      const excerptResult = await client.callTool({
+        name: "arkts_read_source_excerpt",
+        arguments: {
+          workspaceRoot: workspace.root,
+          cacheDir,
+          targetFile: "src/utils/helper.ts",
+          symbolQuery: "greet",
+          maxLines: 20,
+        },
+      });
+      const excerpt = getStructuredContent(excerptResult);
+      assert.equal(excerpt.targetFile, workspace.helperFile);
+      assert.equal(excerpt.excerpt.provenance, "snapshot");
+      assert.equal(excerpt.excerpt.evidenceLevel, "source");
+      assert.match(excerpt.excerpt.content, /export function greet/);
+
+      const evidenceResult = await client.callTool({
+        name: "arkts_get_evidence_context",
+        arguments: {
+          workspaceRoot: workspace.root,
+          cacheDir,
+          targetFile: "src/App.ets",
+          question: "哪里构造 Card 并调用 helper",
+          includeRelated: true,
+          snippetCount: 3,
+          budgetChars: 4000,
+        },
+      });
+      const evidence = getStructuredContent(evidenceResult);
+      assert.equal(evidence.rootFile, workspace.appFile);
+      assert.equal(evidence.provenance, "snapshot");
+      assert.ok(evidence.snippets.length >= 1);
+      assert.ok(evidence.snippets.some((snippet) =>
+        snippet.fileName === workspace.appFile &&
+        snippet.content.includes("const card = new Card()")
+      ));
+      assert.ok(evidence.snippets.every((snippet) =>
+        snippet.evidenceLevel === "source" &&
+        typeof snippet.truncated === "boolean" &&
+        snippet.provenance &&
+        snippet.range
+      ));
+
+      const liveEvidenceResult = await client.callTool({
+        name: "arkts_get_evidence_context",
+        arguments: {
+          workspaceRoot: workspace.root,
+          cacheDir,
+          targetFile: "src/App.ets",
+          symbolQuery: "App",
+          snippetCount: 2,
+          budgetChars: 1200,
+          files: [
+            {
+              fileName: "src/App.ets",
+              content: `import { Card } from "./Card.ets";
+import { greet } from "./utils/helper.ts";
+
+@Entry
+@Component
+struct App {
+  build() {
+    greet();
+    return "overlay";
+  }
+}
+`,
+            },
+          ],
+        },
+      });
+      const liveEvidence = getStructuredContent(liveEvidenceResult);
+      assert.equal(liveEvidence.provenance, "live");
+      assert.ok(liveEvidence.snippets.some((snippet) =>
+        snippet.provenance === "live" && snippet.content.includes('return "overlay"')
+      ));
 
       const traceResult = await client.callTool({
         name: "arkts_trace_dependencies",
@@ -696,6 +785,7 @@ struct App {
         },
       });
       const trace = getStructuredContent(traceResult);
+      assert.equal(trace.provenance, "snapshot");
       assert.ok(trace.nodes.some((node) => node.fileName === workspace.appFile));
       assert.ok(trace.edges.some((edge) => edge.to === workspace.helperFile));
 

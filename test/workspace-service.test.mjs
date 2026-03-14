@@ -219,6 +219,79 @@ struct App {
   }
 });
 
+test("WorkspaceService produces source-backed evidence with provenance and bounded snippets", async () => {
+  const workspace = await createWorkspaceFixture("arkts-workspace-evidence-");
+  const cacheDir = path.join(workspace.root, ".cache-test");
+
+  try {
+    WorkspaceService.resetForTests();
+    const service = await WorkspaceService.initialize(workspace.root, {
+      cacheDir,
+    });
+
+    const relatedFiles = await service.getRelatedFiles({
+      targetFile: "src/App.ets",
+      limit: 3,
+    });
+    const excerpt = await service.readSourceExcerpt({
+      targetFile: "src/utils/helper.ts",
+      symbolQuery: "greet",
+      maxLines: 20,
+    });
+    const evidence = await service.getEvidenceContext({
+      targetFile: "src/App.ets",
+      question: "哪里构造 Card 并调用 helper",
+      includeRelated: true,
+      snippetCount: 3,
+      budgetChars: 3000,
+    });
+    const liveExcerpt = await service.readSourceExcerpt({
+      targetFile: "src/App.ets",
+      symbolQuery: "App",
+    }, [
+      {
+        fileName: "src/App.ets",
+        content: `import { Card } from "./Card.ets";
+import { greet } from "./utils/helper.ts";
+
+@Entry
+@Component
+struct App {
+  build() {
+    greet();
+    return "overlay";
+  }
+}
+`,
+      },
+    ]);
+
+    assert.equal(relatedFiles.provenance, "snapshot");
+    assert.ok(relatedFiles.files.every((file) =>
+      typeof file.snippet === "string" &&
+      typeof file.snippetTruncated === "boolean" &&
+      file.snippetRange &&
+      file.evidenceLevel === "summary"
+    ));
+    assert.equal(excerpt.excerpt.provenance, "snapshot");
+    assert.equal(excerpt.excerpt.evidenceLevel, "source");
+    assert.match(excerpt.excerpt.content, /export function greet/);
+    assert.ok(evidence.snippets.some((snippet) =>
+      snippet.fileName === workspace.appFile &&
+      snippet.content.includes("const card = new Card()")
+    ));
+    assert.ok(evidence.snippets.every((snippet) =>
+      snippet.evidenceLevel === "source" &&
+      typeof snippet.truncated === "boolean"
+    ));
+    assert.equal(liveExcerpt.excerpt.provenance, "live");
+    assert.match(liveExcerpt.excerpt.content, /return "overlay"/);
+  } finally {
+    WorkspaceService.resetForTests();
+    await rm(workspace.root, { recursive: true, force: true });
+  }
+});
+
 async function createWorkspaceFixture(prefix) {
   const createdRoot = await mkdtemp(path.join(os.tmpdir(), prefix));
   const root = await realpath(createdRoot);
