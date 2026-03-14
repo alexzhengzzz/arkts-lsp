@@ -51,6 +51,8 @@ export type {
   WorkspaceFreshness,
   WorkspaceOverview,
   WorkspaceOverlayFile,
+  WorkspaceProgressEvent,
+  WorkspaceProgressReporter,
   WorkspaceProvenance,
   WorkspaceServiceOptions,
   WorkspaceSnapshot,

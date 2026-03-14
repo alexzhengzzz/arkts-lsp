@@ -17,6 +17,7 @@ export declare class WorkspaceService {
     private readonly workspaceId;
     private readonly optionsHash;
     private readonly cacheFile;
+    private progressReporter;
     private snapshot;
     private baseAnalyzer;
     private fileStates;
@@ -49,6 +50,7 @@ export declare class WorkspaceService {
     traceDependencies(options: TraceDependenciesOptions): Promise<DependencyTrace>;
     private loadOrBuildSnapshot;
     private rebuildSnapshot;
+    private reportProgress;
     private createSnapshotFromFileSummaries;
     private createSnapshotFromIndexes;
     private createBaseAnalyzer;

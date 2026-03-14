@@ -6,9 +6,27 @@ async function main() {
         printHelp();
         return;
     }
-    const service = await WorkspaceService.initialize(options.workspaceRoot, options.serviceOptions);
+    const progressLogger = createVerboseProgressLogger(options);
+    const serviceOptions = {
+        ...options.serviceOptions,
+        progressReporter: (event) => {
+            progressLogger(event);
+        },
+    };
+    const startedAt = Date.now();
+    logVerbose(options, `Starting workspace index build for ${options.workspaceRoot}`);
+    const initializeStartedAt = Date.now();
+    logVerbose(options, "Initializing workspace service");
+    const service = await WorkspaceService.initialize(options.workspaceRoot, serviceOptions);
+    const initializeDurationMs = Date.now() - initializeStartedAt;
+    const initializedOverview = service.getOverview();
+    logVerbose(options, `Initialized in ${initializeDurationMs}ms (cache=${initializedOverview.cacheStatus}, files=${initializedOverview.fileCount})`);
+    const refreshStartedAt = Date.now();
+    logVerbose(options, "Refreshing workspace snapshot");
     const refresh = await service.refresh();
     const overview = service.getOverview();
+    const refreshDurationMs = Date.now() - refreshStartedAt;
+    logVerbose(options, `Refresh completed in ${refreshDurationMs}ms (mode=${refresh.refreshMode}, reindexed=${refresh.reindexedFileCount})`);
     const result = {
         workspaceRoot: overview.workspaceRoot,
         workspaceId: overview.workspaceId,
@@ -23,6 +41,7 @@ async function main() {
         reusedFileCount: refresh.reusedFileCount,
         overview: overview.overview,
     };
+    logVerbose(options, `Workspace index build finished in ${Date.now() - startedAt}ms`);
     if (options.json) {
         process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
         return;
@@ -40,6 +59,7 @@ function parseArgs(args) {
     let workspaceRoot = process.cwd();
     let json = false;
     let help = false;
+    let verbose = false;
     let maxFiles;
     let cacheDir;
     let freshness;
@@ -54,6 +74,10 @@ function parseArgs(args) {
         }
         if (argument === "--help" || argument === "-h") {
             help = true;
+            continue;
+        }
+        if (argument === "--verbose") {
+            verbose = true;
             continue;
         }
         if (argument === "--cache-dir") {
@@ -102,6 +126,7 @@ function parseArgs(args) {
         workspaceRoot: path.resolve(workspaceRoot),
         json,
         help,
+        verbose,
         serviceOptions,
     };
 }
@@ -120,11 +145,65 @@ function printHelp() {
 
 Options:
   --json                     Print machine-readable JSON output.
+  --verbose                  Print stage-level and file-count progress logs to stderr.
   --cache-dir <path>         Override the workspace snapshot cache directory.
   --max-files <n|null>       Override maxFiles. Use "null" or "unlimited" for no cap.
   --freshness <mtime|always> Override cache freshness policy.
   --help, -h                 Show this help text.
 `);
+}
+function logVerbose(options, message) {
+    if (!options.verbose) {
+        return;
+    }
+    process.stderr.write(`[workspace:index] ${message}\n`);
+}
+function createVerboseProgressLogger(options) {
+    let lastDiscoveredCount = 0;
+    let lastIndexedCount = 0;
+    let lastIndexedTotal = 0;
+    let lastIndexMode = null;
+    return (event) => {
+        if (!options.verbose) {
+            return;
+        }
+        if (event.phase === "discover") {
+            if (shouldLogProgress(event.discoveredFiles, event.maxFiles)) {
+                lastDiscoveredCount = event.discoveredFiles;
+                const capText = event.maxFiles === null ? "unlimited" : String(event.maxFiles);
+                logVerbose(options, `Discovered ${event.discoveredFiles} matching workspace files (maxFiles=${capText})`);
+            }
+            if (event.done && event.discoveredFiles !== lastDiscoveredCount) {
+                const suffix = event.truncated ? ", truncated by maxFiles" : "";
+                logVerbose(options, `Discovered ${event.discoveredFiles} matching workspace files${suffix}`);
+                lastDiscoveredCount = event.discoveredFiles;
+            }
+            return;
+        }
+        if (event.mode !== lastIndexMode ||
+            event.totalFiles !== lastIndexedTotal ||
+            shouldLogProgress(event.processedFiles, event.totalFiles)) {
+            lastIndexMode = event.mode;
+            lastIndexedTotal = event.totalFiles;
+            lastIndexedCount = event.processedFiles;
+            logVerbose(options, `Indexed ${event.processedFiles}/${event.totalFiles} files (${event.mode})`);
+            return;
+        }
+        if (event.processedFiles === event.totalFiles &&
+            event.processedFiles !== lastIndexedCount) {
+            lastIndexedCount = event.processedFiles;
+            logVerbose(options, `Indexed ${event.processedFiles}/${event.totalFiles} files (${event.mode})`);
+        }
+    };
+}
+function shouldLogProgress(current, total) {
+    if (current <= 0) {
+        return false;
+    }
+    if (total !== null && total <= 20) {
+        return true;
+    }
+    return current === 1 || current % 100 === 0;
 }
 main().catch((error) => {
     const message = error instanceof Error ? error.message : String(error);

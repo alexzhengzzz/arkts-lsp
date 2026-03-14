@@ -13,6 +13,20 @@ export type EvidenceLevel = "summary" | "source";
 export type WorkspaceFileLanguage = "arkts" | "typescript" | "javascript";
 export type WorkspaceFileRole = "entrypoint" | "component" | "module" | "script";
 export type ContextRelation = "self" | "imports" | "importedBy" | "dependency";
+export type WorkspaceProgressEvent = {
+    phase: "discover";
+    discoveredFiles: number;
+    maxFiles: number | null;
+    done: boolean;
+    truncated: boolean;
+} | {
+    phase: "index";
+    mode: "full" | "incremental";
+    processedFiles: number;
+    totalFiles: number;
+    fileName: string;
+};
+export type WorkspaceProgressReporter = (event: WorkspaceProgressEvent) => void;
 export interface WorkspaceOverlayFile {
     fileName: string;
     content: string;
@@ -23,6 +37,7 @@ export interface WorkspaceServiceOptions {
     maxFiles?: number | null | undefined;
     cacheDir?: string | undefined;
     freshness?: WorkspaceFreshness | undefined;
+    progressReporter?: WorkspaceProgressReporter | undefined;
 }
 export interface StateMemberSummary {
     name: string;

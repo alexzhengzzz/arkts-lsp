@@ -36,9 +36,10 @@ export class WorkspaceService {
         const existing = WorkspaceService.sessions.get(sessionKey);
         if (existing) {
             existing.cacheStatus = "memory";
+            existing.progressReporter = options.progressReporter;
             return existing;
         }
-        const service = new WorkspaceService(workspaceRoot, normalizedOptions);
+        const service = new WorkspaceService(workspaceRoot, normalizedOptions, options.progressReporter);
         await service.loadOrBuildSnapshot();
         WorkspaceService.sessions.set(sessionKey, service);
         return service;
@@ -49,6 +50,7 @@ export class WorkspaceService {
     workspaceId;
     optionsHash;
     cacheFile;
+    progressReporter;
     snapshot = null;
     baseAnalyzer = null;
     fileStates = [];
@@ -59,12 +61,13 @@ export class WorkspaceService {
     symbolsByFile = new Map();
     outgoingEdgesByFile = new Map();
     incomingEdgesByFile = new Map();
-    constructor(workspaceRoot, options) {
+    constructor(workspaceRoot, options, progressReporter) {
         this.workspaceRoot = workspaceRoot;
         this.options = options;
         this.workspaceId = hashString(this.workspaceRoot).slice(0, 12);
         this.optionsHash = hashString(stableStringify(this.options));
         this.cacheFile = path.join(this.options.cacheDir, `${this.workspaceId}.json`);
+        this.progressReporter = progressReporter;
     }
     getOverview() {
         const snapshot = this.requireSnapshot();
@@ -84,7 +87,9 @@ export class WorkspaceService {
     }
     async refresh(changedFiles = []) {
         const normalizedChangedFiles = dedupePaths(changedFiles.map((fileName) => this.resolveWorkspacePath(fileName)));
-        const discovery = await discoverWorkspaceFiles(this.workspaceRoot, this.options);
+        const discovery = await discoverWorkspaceFiles(this.workspaceRoot, this.options, (event) => {
+            this.reportProgress(event);
+        });
         if (this.baseAnalyzer === null ||
             (normalizedChangedFiles.length === 0 && (this.truncated || discovery.truncated))) {
             await this.rebuildSnapshot(discovery);
@@ -126,8 +131,16 @@ export class WorkspaceService {
             removedFiles: diff.removedFiles,
         });
         this.removeIndexedFiles([...diff.removedFiles, ...reindexedFiles]);
-        for (const fileName of reindexedFiles) {
+        const totalReindexedFiles = reindexedFiles.length;
+        for (const [index, fileName] of reindexedFiles.entries()) {
             this.indexFileSummary(this.createFileSummary(this.baseAnalyzer, fileName));
+            this.reportProgress({
+                phase: "index",
+                mode: "incremental",
+                processedFiles: index + 1,
+                totalFiles: totalReindexedFiles,
+                fileName,
+            });
         }
         this.rebuildIncomingEdgesIndex();
         this.setSnapshot(this.createSnapshotFromIndexes());
@@ -494,15 +507,32 @@ export class WorkspaceService {
         await this.rebuildSnapshot(discovery);
     }
     async rebuildSnapshot(discovery) {
-        const nextDiscovery = discovery ?? await discoverWorkspaceFiles(this.workspaceRoot, this.options);
+        const nextDiscovery = discovery ??
+            await discoverWorkspaceFiles(this.workspaceRoot, this.options, (event) => {
+                this.reportProgress(event);
+            });
         this.discoveredFiles = nextDiscovery.fileNames;
         this.truncated = nextDiscovery.truncated;
         this.baseAnalyzer = this.createBaseAnalyzer(this.discoveredFiles);
-        const fileSummaries = this.discoveredFiles.map((fileName) => this.createFileSummary(this.baseAnalyzer, fileName));
+        const fileSummaries = [];
+        const totalDiscoveredFiles = this.discoveredFiles.length;
+        for (const [index, fileName] of this.discoveredFiles.entries()) {
+            fileSummaries.push(this.createFileSummary(this.baseAnalyzer, fileName));
+            this.reportProgress({
+                phase: "index",
+                mode: "full",
+                processedFiles: index + 1,
+                totalFiles: totalDiscoveredFiles,
+                fileName,
+            });
+        }
         this.setSnapshot(this.createSnapshotFromFileSummaries(fileSummaries));
         this.fileStates = await collectFileStates(this.discoveredFiles);
         this.cacheStatus = "rebuilt";
         await this.persistSnapshot();
+    }
+    reportProgress(event) {
+        this.progressReporter?.(event);
     }
     createSnapshotFromFileSummaries(fileSummaries) {
         const sortedFiles = [...fileSummaries].sort((left, right) => left.fileName.localeCompare(right.fileName));
@@ -963,7 +993,7 @@ function normalizePatternList(patterns, defaults) {
     const sourcePatterns = patterns && patterns.length > 0 ? patterns : defaults;
     return sourcePatterns.map((pattern) => toPosixPath(pattern.trim())).filter(Boolean);
 }
-async function discoverWorkspaceFiles(workspaceRoot, options) {
+async function discoverWorkspaceFiles(workspaceRoot, options, progressReporter) {
     const fileNames = [];
     const queue = [workspaceRoot];
     let truncated = false;
@@ -997,8 +1027,22 @@ async function discoverWorkspaceFiles(workspaceRoot, options) {
                 continue;
             }
             fileNames.push(path.normalize(absolutePath));
+            progressReporter?.({
+                phase: "discover",
+                discoveredFiles: fileNames.length,
+                maxFiles: options.maxFiles,
+                done: false,
+                truncated: false,
+            });
             if (options.maxFiles !== null && fileNames.length >= options.maxFiles) {
                 truncated = true;
+                progressReporter?.({
+                    phase: "discover",
+                    discoveredFiles: fileNames.length,
+                    maxFiles: options.maxFiles,
+                    done: true,
+                    truncated,
+                });
                 return {
                     fileNames,
                     truncated,
@@ -1006,6 +1050,13 @@ async function discoverWorkspaceFiles(workspaceRoot, options) {
             }
         }
     }
+    progressReporter?.({
+        phase: "discover",
+        discoveredFiles: fileNames.length,
+        maxFiles: options.maxFiles,
+        done: true,
+        truncated,
+    });
     return {
         fileNames,
         truncated,

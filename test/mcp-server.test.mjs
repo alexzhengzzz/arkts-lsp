@@ -908,7 +908,7 @@ test("workspace index CLI builds and refreshes a workspace snapshot", async () =
   try {
     const result = spawnSync(
       process.execPath,
-      [workspaceIndexScriptPath, workspace.root, "--json", "--max-files", "null"],
+      [workspaceIndexScriptPath, workspace.root, "--json", "--verbose", "--max-files", "null"],
       {
         cwd: process.cwd(),
         encoding: "utf8",
@@ -922,6 +922,10 @@ test("workspace index CLI builds and refreshes a workspace snapshot", async () =
     assert.equal(data.truncated, false);
     assert.equal(typeof data.refreshMode, "string");
     assert.match(data.overview, /Workspace indexes 4 file\(s\)/);
+    assert.match(result.stderr, /\[workspace:index\] Starting workspace index build/);
+    assert.match(result.stderr, /\[workspace:index\] Discovered 4 matching workspace files/);
+    assert.match(result.stderr, /\[workspace:index\] Indexed 4\/4 files \(full\)/);
+    assert.match(result.stderr, /\[workspace:index\] Refresh completed/);
   } finally {
     await rm(workspace.root, { recursive: true, force: true });
   }

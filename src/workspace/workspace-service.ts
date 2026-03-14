@@ -51,6 +51,8 @@ import type {
   WorkspaceSnapshot,
   WorkspaceFileLanguage,
   WorkspaceFileRole,
+  WorkspaceProgressEvent,
+  WorkspaceProgressReporter,
 } from "./types.js";
 
 interface NormalizedWorkspaceOptions {
@@ -162,10 +164,15 @@ export class WorkspaceService {
 
     if (existing) {
       existing.cacheStatus = "memory";
+      existing.progressReporter = options.progressReporter;
       return existing;
     }
 
-    const service = new WorkspaceService(workspaceRoot, normalizedOptions);
+    const service = new WorkspaceService(
+      workspaceRoot,
+      normalizedOptions,
+      options.progressReporter,
+    );
     await service.loadOrBuildSnapshot();
     WorkspaceService.sessions.set(sessionKey, service);
     return service;
@@ -178,6 +185,7 @@ export class WorkspaceService {
   private readonly workspaceId: string;
   private readonly optionsHash: string;
   private readonly cacheFile: string;
+  private progressReporter: WorkspaceProgressReporter | undefined;
 
   private snapshot: WorkspaceSnapshot | null = null;
   private baseAnalyzer: ArkTSAnalyzer | null = null;
@@ -193,10 +201,12 @@ export class WorkspaceService {
   private constructor(
     private readonly workspaceRoot: string,
     private readonly options: NormalizedWorkspaceOptions,
+    progressReporter?: WorkspaceProgressReporter,
   ) {
     this.workspaceId = hashString(this.workspaceRoot).slice(0, 12);
     this.optionsHash = hashString(stableStringify(this.options));
     this.cacheFile = path.join(this.options.cacheDir, `${this.workspaceId}.json`);
+    this.progressReporter = progressReporter;
   }
 
   public getOverview(): WorkspaceOverview {
@@ -220,7 +230,13 @@ export class WorkspaceService {
     const normalizedChangedFiles = dedupePaths(
       changedFiles.map((fileName) => this.resolveWorkspacePath(fileName)),
     );
-    const discovery = await discoverWorkspaceFiles(this.workspaceRoot, this.options);
+    const discovery = await discoverWorkspaceFiles(
+      this.workspaceRoot,
+      this.options,
+      (event) => {
+        this.reportProgress(event);
+      },
+    );
 
     if (
       this.baseAnalyzer === null ||
@@ -275,8 +291,16 @@ export class WorkspaceService {
     });
 
     this.removeIndexedFiles([...diff.removedFiles, ...reindexedFiles]);
-    for (const fileName of reindexedFiles) {
+    const totalReindexedFiles = reindexedFiles.length;
+    for (const [index, fileName] of reindexedFiles.entries()) {
       this.indexFileSummary(this.createFileSummary(this.baseAnalyzer, fileName));
+      this.reportProgress({
+        phase: "index",
+        mode: "incremental",
+        processedFiles: index + 1,
+        totalFiles: totalReindexedFiles,
+        fileName,
+      });
     }
 
     this.rebuildIncomingEdgesIndex();
@@ -783,17 +807,36 @@ export class WorkspaceService {
   }
 
   private async rebuildSnapshot(discovery?: DiscoverWorkspaceResult): Promise<void> {
-    const nextDiscovery = discovery ?? await discoverWorkspaceFiles(this.workspaceRoot, this.options);
+    const nextDiscovery =
+      discovery ??
+      await discoverWorkspaceFiles(this.workspaceRoot, this.options, (event) => {
+        this.reportProgress(event);
+      });
     this.discoveredFiles = nextDiscovery.fileNames;
     this.truncated = nextDiscovery.truncated;
     this.baseAnalyzer = this.createBaseAnalyzer(this.discoveredFiles);
-    const fileSummaries = this.discoveredFiles.map((fileName) =>
-      this.createFileSummary(this.baseAnalyzer as ArkTSAnalyzer, fileName),
-    );
+    const fileSummaries: FileSummary[] = [];
+    const totalDiscoveredFiles = this.discoveredFiles.length;
+    for (const [index, fileName] of this.discoveredFiles.entries()) {
+      fileSummaries.push(
+        this.createFileSummary(this.baseAnalyzer as ArkTSAnalyzer, fileName),
+      );
+      this.reportProgress({
+        phase: "index",
+        mode: "full",
+        processedFiles: index + 1,
+        totalFiles: totalDiscoveredFiles,
+        fileName,
+      });
+    }
     this.setSnapshot(this.createSnapshotFromFileSummaries(fileSummaries));
     this.fileStates = await collectFileStates(this.discoveredFiles);
     this.cacheStatus = "rebuilt";
     await this.persistSnapshot();
+  }
+
+  private reportProgress(event: WorkspaceProgressEvent): void {
+    this.progressReporter?.(event);
   }
 
   private createSnapshotFromFileSummaries(fileSummaries: FileSummary[]): WorkspaceSnapshot {
@@ -1445,6 +1488,7 @@ function normalizePatternList(
 async function discoverWorkspaceFiles(
   workspaceRoot: string,
   options: NormalizedWorkspaceOptions,
+  progressReporter?: WorkspaceProgressReporter,
 ): Promise<DiscoverWorkspaceResult> {
   const fileNames: string[] = [];
   const queue = [workspaceRoot];
@@ -1488,8 +1532,22 @@ async function discoverWorkspaceFiles(
       }
 
       fileNames.push(path.normalize(absolutePath));
+      progressReporter?.({
+        phase: "discover",
+        discoveredFiles: fileNames.length,
+        maxFiles: options.maxFiles,
+        done: false,
+        truncated: false,
+      });
       if (options.maxFiles !== null && fileNames.length >= options.maxFiles) {
         truncated = true;
+        progressReporter?.({
+          phase: "discover",
+          discoveredFiles: fileNames.length,
+          maxFiles: options.maxFiles,
+          done: true,
+          truncated,
+        });
         return {
           fileNames,
           truncated,
@@ -1497,6 +1555,14 @@ async function discoverWorkspaceFiles(
       }
     }
   }
+
+  progressReporter?.({
+    phase: "discover",
+    discoveredFiles: fileNames.length,
+    maxFiles: options.maxFiles,
+    done: true,
+    truncated,
+  });
 
   return {
     fileNames,

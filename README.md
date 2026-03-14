@@ -79,7 +79,23 @@ npm run workspace:index -- /absolute/path/to/workspace
 ```
 
 `start:mcp` 会通过 stdio 启动 `dist/mcp-server.js`，因此首次运行前需要先执行 `npm run build`。
-`workspace:index` 会为目标目录执行一次工作区初始化并立刻 `refresh()`，用来快速触发全仓索引构建或增量刷新；默认目标目录是当前工作目录，也支持 `--json`、`--cache-dir`、`--max-files`、`--freshness`。
+`workspace:index` 会为目标目录执行一次工作区初始化并立刻 `refresh()`，用来快速触发全仓索引构建或增量刷新；默认目标目录是当前工作目录，也支持 `--json`、`--verbose`、`--cache-dir`、`--max-files`、`--freshness`。其中 `--verbose` 会把阶段日志、已发现文件数和索引进度输出到 `stderr`。
+
+### 建索引命令示例
+
+```bash
+# 对当前仓库触发一次索引构建/刷新
+npm run workspace:index -- .
+
+# 对指定目录触发一次索引构建/刷新，并输出 JSON
+npm run workspace:index -- /absolute/path/to/workspace --json
+
+# 对当前仓库触发一次索引构建/刷新，并关闭 maxFiles 上限
+npm run workspace:index -- . --max-files null
+
+# 对当前仓库触发一次索引构建/刷新，并显示阶段日志与文件进度
+npm run workspace:index -- . --verbose
+```
 
 ## MCP 配置示例
 
