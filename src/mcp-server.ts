@@ -50,7 +50,7 @@ interface WorkspaceServiceInput {
   workspaceRoot?: string | undefined;
   include?: string[] | undefined;
   exclude?: string[] | undefined;
-  maxFiles?: number | undefined;
+  maxFiles?: number | null | undefined;
   cacheDir?: string | undefined;
   freshness?: "mtime" | "always" | undefined;
 }
@@ -281,11 +281,9 @@ const workspaceServiceInputSchema = {
     .optional()
     .describe("Optional exclude globs for workspace discovery."),
   maxFiles: z
-    .number()
-    .int()
-    .positive()
+    .union([z.number().int().positive(), z.null()])
     .optional()
-    .describe("Maximum number of workspace files to index."),
+    .describe("Maximum number of workspace files to index. Use null to disable the cap."),
   cacheDir: z
     .string()
     .min(1)

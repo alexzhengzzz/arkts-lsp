@@ -939,12 +939,25 @@ function normalizeWorkspaceOptions(workspaceRoot, options) {
     return {
         include: normalizePatternList(options.include, DEFAULT_INCLUDE),
         exclude: normalizePatternList(options.exclude, DEFAULT_EXCLUDE),
-        maxFiles: clamp(options.maxFiles ?? DEFAULT_MAX_FILES, 1, 50_000),
+        maxFiles: normalizeMaxFilesOption(options.maxFiles),
         cacheDir: path.normalize(path.isAbsolute(cacheBaseDir)
             ? cacheBaseDir
             : path.resolve(workspaceRoot, cacheBaseDir)),
         freshness: options.freshness ?? "mtime",
     };
+}
+function normalizeMaxFilesOption(maxFiles) {
+    if (maxFiles === undefined) {
+        return DEFAULT_MAX_FILES;
+    }
+    if (maxFiles === null || !Number.isFinite(maxFiles)) {
+        return null;
+    }
+    const normalized = Math.trunc(maxFiles);
+    if (normalized <= 0) {
+        return null;
+    }
+    return Math.min(normalized, Number.MAX_SAFE_INTEGER);
 }
 function normalizePatternList(patterns, defaults) {
     const sourcePatterns = patterns && patterns.length > 0 ? patterns : defaults;
@@ -984,7 +997,7 @@ async function discoverWorkspaceFiles(workspaceRoot, options) {
                 continue;
             }
             fileNames.push(path.normalize(absolutePath));
-            if (fileNames.length >= options.maxFiles) {
+            if (options.maxFiles !== null && fileNames.length >= options.maxFiles) {
                 truncated = true;
                 return {
                     fileNames,

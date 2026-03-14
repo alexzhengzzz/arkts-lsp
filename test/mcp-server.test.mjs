@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -8,6 +9,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 const serverPath = path.resolve(process.cwd(), "dist/mcp-server.js");
+const workspaceIndexScriptPath = path.resolve(process.cwd(), "dist/build-workspace-index.js");
 
 test("MCP server lists the required ArkTS tools", async () => {
   await withClient({}, async (client) => {
@@ -639,9 +641,35 @@ test("language-service MCP tools return hover, references, implementations, type
 test("workspace MCP tools build repo maps, honor overlays, and refresh snapshots", async () => {
   const workspace = await createWorkspaceFixture("arkts-mcp-workspace-");
   const cacheDir = path.join(workspace.root, ".cache-test");
+  const limitedCacheDir = path.join(workspace.root, ".cache-limited");
+  const unlimitedCacheDir = path.join(workspace.root, ".cache-unlimited");
 
   try {
     await withClient({}, async (client) => {
+      const limitedOverviewResult = await client.callTool({
+        name: "arkts_workspace_overview",
+        arguments: {
+          workspaceRoot: workspace.root,
+          cacheDir: limitedCacheDir,
+          maxFiles: 1,
+        },
+      });
+      const limitedOverview = getStructuredContent(limitedOverviewResult);
+      assert.equal(limitedOverview.fileCount, 1);
+      assert.equal(limitedOverview.truncated, true);
+
+      const unlimitedOverviewResult = await client.callTool({
+        name: "arkts_workspace_overview",
+        arguments: {
+          workspaceRoot: workspace.root,
+          cacheDir: unlimitedCacheDir,
+          maxFiles: null,
+        },
+      });
+      const unlimitedOverview = getStructuredContent(unlimitedOverviewResult);
+      assert.equal(unlimitedOverview.fileCount, 4);
+      assert.equal(unlimitedOverview.truncated, false);
+
       const overviewResult = await client.callTool({
         name: "arkts_workspace_overview",
         arguments: {
@@ -869,6 +897,31 @@ struct App {
       const refreshedSymbols = getStructuredContent(refreshedSymbolResult);
       assert.equal(refreshedSymbols.matches[0]?.fileName, workspace.helperFile);
     });
+  } finally {
+    await rm(workspace.root, { recursive: true, force: true });
+  }
+});
+
+test("workspace index CLI builds and refreshes a workspace snapshot", async () => {
+  const workspace = await createWorkspaceFixture("arkts-workspace-index-cli-");
+
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [workspaceIndexScriptPath, workspace.root, "--json", "--max-files", "null"],
+      {
+        cwd: process.cwd(),
+        encoding: "utf8",
+      },
+    );
+
+    assert.equal(result.status, 0, result.stderr);
+    const data = JSON.parse(result.stdout);
+    assert.equal(data.workspaceRoot, workspace.root);
+    assert.equal(data.fileCount, 4);
+    assert.equal(data.truncated, false);
+    assert.equal(typeof data.refreshMode, "string");
+    assert.match(data.overview, /Workspace indexes 4 file\(s\)/);
   } finally {
     await rm(workspace.root, { recursive: true, force: true });
   }

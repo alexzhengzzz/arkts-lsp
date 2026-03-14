@@ -46,6 +46,7 @@
 
 - `src/index.ts`: 包导出入口。
 - `src/mcp-server.ts`: MCP stdio server 与 17 个工具注册。
+- `src/build-workspace-index.ts`: 本地一次性触发工作区索引构建的 CLI。
 - `src/core/arkts-analyzer.ts`: 单文件 ArkTS 分析核心。
 - `src/core/compiler-host.ts`: TypeScript compiler host / language service host 适配。
 - `src/core/arkts-language.ts`: ArkTS 装饰器和内建语义定义。
@@ -65,6 +66,7 @@
 npm install
 npm run build
 npm run start:mcp
+npm run workspace:index -- .
 ```
 
 常用命令：
@@ -73,9 +75,11 @@ npm run start:mcp
 npm run check
 npm test
 npm run clean
+npm run workspace:index -- /absolute/path/to/workspace
 ```
 
 `start:mcp` 会通过 stdio 启动 `dist/mcp-server.js`，因此首次运行前需要先执行 `npm run build`。
+`workspace:index` 会为目标目录执行一次工作区初始化并立刻 `refresh()`，用来快速触发全仓索引构建或增量刷新；默认目标目录是当前工作目录，也支持 `--json`、`--cache-dir`、`--max-files`、`--freshness`。
 
 ## MCP 配置示例
 
@@ -99,3 +103,23 @@ npm run clean
 - 从入口组件出发追踪本地模块依赖关系。
 - 为编辑器、脚本或自动化流程提供只读 ArkTS 代码智能能力。
 - 让 agent 先用 summary 工具做定位和结构理解，再用源码证据工具确认实现细节、bug 位置和修改影响。
+
+## 路径兼容约定
+
+为避免 Windows 与 POSIX 平台上的路径拼写差异导致分析结果不一致，仓库内的文件处理遵循以下规则：
+
+- 文件身份比较不能直接使用原始路径字符串，必须先做内部 canonicalization。
+- canonicalization 规则：
+  - 先做绝对化和 `path.normalize()`
+  - 将分隔符统一为 `/`
+  - 在大小写不敏感的平台上统一转为小写
+  - `__arkts_intrinsics__.d.ts` 作为特殊内建文件单独处理
+- 内部文件身份与对外返回路径分离：
+  - 内部匹配、去重、索引、overlay 命中使用 canonical key
+  - 对外结果保留实际 `sourceFile.fileName` 或平台原生路径
+- `inMemoryFiles`、`rootNames`、`scriptVersions`、`program.getSourceFile()`、模块解析结果必须共用同一套文件身份规则。
+- 扩展名省略导入如 `./helper` 的解析结果，必须映射回实际已登记的 overlay 文件名，不能直接信任解析器临时生成的路径拼写。
+- 处理虚拟文件时，路径解析要按文件自身风格选择 `path.posix` 或 `path.win32`，不能默认套用宿主平台路径语义。
+- 已存在的真实文件在对外返回时优先使用 `realpath`，避免测试和客户端看到不同的等价路径。
+
+新增或修改路径相关逻辑时，至少要补一条 Windows 回归测试；涉及 MCP 路径归一化时，也要同步验证 `test/mcp-server.test.mjs` 中的相对路径和 overlay 场景。

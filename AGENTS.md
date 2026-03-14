@@ -42,6 +42,23 @@ Use this order when it fits the task:
 - When the user asks for a summary of a repo problem, first build repo context with MCP, then drill into a small number of files.
 - Treat `workspace_overview`, `summarize_file`, `get_related_files`, and `trace_dependencies` as valid analysis tools, but prefer `arkts_read_source_excerpt` or `arkts_get_evidence_context` before making precise implementation claims.
 
+## Path Compatibility Rules
+
+- Do not compare file paths by raw string equality when the value may cross MCP, analyzer, TypeScript host, or Windows boundaries.
+- Use the shared internal canonicalization rule for file identity:
+  - resolve/normalize first
+  - convert separators to `/`
+  - lowercase on case-insensitive systems
+  - keep `__arkts_intrinsics__.d.ts` as a special intrinsic identity
+- Keep internal file identity separate from user-facing file paths:
+  - canonical keys are for matching, dedupe, overlays, and indexes
+  - returned paths should stay as real `sourceFile.fileName` values or platform-native resolved paths
+- When adding logic around `inMemoryFiles`, `rootNames`, `scriptVersions`, `program.getSourceFile()`, or module resolution, make sure they all use the same file-identity rule.
+- When resolving extensionless relative imports like `./helper`, map the resolved candidate back to the registered overlay file name instead of trusting the temporary resolved spelling.
+- For virtual files, choose `path.posix` vs `path.win32` from the file-name style rather than from the host OS alone.
+- For existing on-disk files exposed by MCP tools, prefer `realpath` so returned paths match test expectations and avoid equivalent-path mismatches on Windows.
+- Any path-handling change should add or update a Windows-focused regression test in `test/arkts-analyzer.test.mjs` or `test/mcp-server.test.mjs`.
+
 ## Documentation Sync
 
 - Keep `README.md` aligned with the actual exported server behavior in `src/mcp-server.ts`.

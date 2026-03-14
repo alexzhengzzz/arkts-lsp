@@ -20,7 +20,7 @@ export interface WorkspaceOverlayFile {
 export interface WorkspaceServiceOptions {
     include?: string[] | undefined;
     exclude?: string[] | undefined;
-    maxFiles?: number | undefined;
+    maxFiles?: number | null | undefined;
     cacheDir?: string | undefined;
     freshness?: WorkspaceFreshness | undefined;
 }
@@ -105,7 +105,7 @@ export interface WorkspaceSnapshot {
     symbolCount: number;
     edgeCount: number;
     truncated: boolean;
-    maxFiles: number;
+    maxFiles: number | null;
     include: string[];
     exclude: string[];
     entryFiles: string[];

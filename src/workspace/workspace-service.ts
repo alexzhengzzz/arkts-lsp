@@ -56,7 +56,7 @@ import type {
 interface NormalizedWorkspaceOptions {
   include: string[];
   exclude: string[];
-  maxFiles: number;
+  maxFiles: number | null;
   cacheDir: string;
   freshness: "mtime" | "always";
 }
@@ -1407,7 +1407,7 @@ function normalizeWorkspaceOptions(
   return {
     include: normalizePatternList(options.include, DEFAULT_INCLUDE),
     exclude: normalizePatternList(options.exclude, DEFAULT_EXCLUDE),
-    maxFiles: clamp(options.maxFiles ?? DEFAULT_MAX_FILES, 1, 50_000),
+    maxFiles: normalizeMaxFilesOption(options.maxFiles),
     cacheDir: path.normalize(
       path.isAbsolute(cacheBaseDir)
         ? cacheBaseDir
@@ -1415,6 +1415,23 @@ function normalizeWorkspaceOptions(
     ),
     freshness: options.freshness ?? "mtime",
   };
+}
+
+function normalizeMaxFilesOption(maxFiles: number | null | undefined): number | null {
+  if (maxFiles === undefined) {
+    return DEFAULT_MAX_FILES;
+  }
+
+  if (maxFiles === null || !Number.isFinite(maxFiles)) {
+    return null;
+  }
+
+  const normalized = Math.trunc(maxFiles);
+  if (normalized <= 0) {
+    return null;
+  }
+
+  return Math.min(normalized, Number.MAX_SAFE_INTEGER);
 }
 
 function normalizePatternList(
@@ -1471,7 +1488,7 @@ async function discoverWorkspaceFiles(
       }
 
       fileNames.push(path.normalize(absolutePath));
-      if (fileNames.length >= options.maxFiles) {
+      if (options.maxFiles !== null && fileNames.length >= options.maxFiles) {
         truncated = true;
         return {
           fileNames,
