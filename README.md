@@ -76,6 +76,7 @@ npm run check
 npm test
 npm run clean
 npm run workspace:index -- /absolute/path/to/workspace
+npm run verify:workspace-cache
 ```
 
 `start:mcp` 会通过 stdio 启动 `dist/mcp-server.js`，因此首次运行前需要先执行 `npm run build`。
@@ -96,6 +97,22 @@ npm run workspace:index -- . --max-files null
 # 对当前仓库触发一次索引构建/刷新，并显示阶段日志与文件进度
 npm run workspace:index -- . --verbose
 ```
+
+### 终端验证缓存命中
+
+```bash
+npm run verify:workspace-cache
+```
+
+这个命令会对 `test/fixtures/sample_test` 连续启动两次 `dist/build-workspace-index.js`，并为两次调用复用同一个临时 `cacheDir`，用于直接验证磁盘快照缓存是否生成且被后续进程命中。
+
+预期终端信号：
+
+- first run: `cacheStatus=rebuilt`
+- second run: `cacheStatus=hit`
+- 命令退出码为 `0`
+
+如果失败，脚本会输出对应 run 的原始 `stdout` / `stderr`，方便直接在终端排查。
 
 ## MCP 配置示例
 
