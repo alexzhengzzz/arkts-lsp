@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -1452,9 +1452,19 @@ function collectOverlayEntries(
 }
 
 function normalizeInputPath(fileName: string): string {
-  return path.normalize(
+  const resolvedPath = path.normalize(
     path.isAbsolute(fileName) ? fileName : path.resolve(process.cwd(), fileName),
   );
+
+  if (!existsSync(resolvedPath)) {
+    return resolvedPath;
+  }
+
+  try {
+    return realpathSync.native?.(resolvedPath) ?? realpathSync(resolvedPath);
+  } catch {
+    return resolvedPath;
+  }
 }
 
 function dedupePaths(fileNames: string[]): string[] {

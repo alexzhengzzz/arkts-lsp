@@ -6,6 +6,7 @@ export function createArkTSCompilerHost(compilerOptions, options = {}) {
     const inMemoryFiles = options.inMemoryFiles ?? new Map();
     const useCaseSensitiveFileNames = system.useCaseSensitiveFileNames;
     const inMemoryFileEntries = indexEntriesByInternalFileName(inMemoryFiles, useCaseSensitiveFileNames);
+    const resolveInternalFileName = (fileName) => inMemoryFileEntries.get(canonicalizeInternalFileName(fileName, useCaseSensitiveFileNames))?.fileName ?? fileName;
     const host = ts.createCompilerHost(compilerOptions, true);
     const originalGetSourceFile = host.getSourceFile.bind(host);
     const originalDirectoryExists = host.directoryExists?.bind(host);
@@ -34,12 +35,13 @@ export function createArkTSCompilerHost(compilerOptions, options = {}) {
     };
     host.getSourceFile = (fileName, languageVersionOrOptions, onError, shouldCreateNewSourceFile) => {
         if (isArkTSFile(fileName)) {
-            const sourceText = host.readFile(fileName);
+            const resolvedFileName = resolveInternalFileName(fileName);
+            const sourceText = host.readFile(resolvedFileName);
             if (sourceText === undefined) {
                 onError?.(`Cannot read ArkTS file: ${fileName}`);
                 return undefined;
             }
-            return ts.createSourceFile(fileName, normalizeArkTSSource(fileName, sourceText), getLanguageVersion(languageVersionOrOptions), true, ts.ScriptKind.TS);
+            return ts.createSourceFile(resolvedFileName, normalizeArkTSSource(resolvedFileName, sourceText), getLanguageVersion(languageVersionOrOptions), true, ts.ScriptKind.TS);
         }
         if (isArkTSIntrinsicFile(fileName)) {
             return ts.createSourceFile(fileName, getArkTSIntrinsicsSource(), getLanguageVersion(languageVersionOrOptions), true, ts.ScriptKind.TS);
@@ -47,6 +49,14 @@ export function createArkTSCompilerHost(compilerOptions, options = {}) {
         return originalGetSourceFile(fileName, languageVersionOrOptions, onError, shouldCreateNewSourceFile);
     };
     host.resolveModuleNames = (moduleNames, containingFile) => moduleNames.map((moduleName) => resolveModuleNameWithArkTSFallback(moduleName, containingFile, compilerOptions, resolutionHost));
+    if (system.realpath) {
+        host.realpath = (fileName) => {
+            const resolvedFileName = resolveInternalFileName(fileName);
+            return inMemoryFileEntries.has(canonicalizeInternalFileName(fileName, useCaseSensitiveFileNames))
+                ? resolvedFileName
+                : system.realpath?.(resolvedFileName) ?? resolvedFileName;
+        };
+    }
     return host;
 }
 export function createArkTSLanguageServiceHost(rootNames, compilerOptions, options = {}) {
@@ -92,7 +102,7 @@ export function createArkTSLanguageServiceHost(rootNames, compilerOptions, optio
         useCaseSensitiveFileNames: () => system.useCaseSensitiveFileNames,
     };
     if (system.realpath) {
-        host.realpath = system.realpath.bind(system);
+        host.realpath = (fileName) => resolutionHost.resolveInternalFileName(fileName);
     }
     return host;
 }
@@ -147,40 +157,54 @@ function createModuleResolutionHost(system, inMemoryFiles, currentDirectory) {
         },
         useCaseSensitiveFileNames: system.useCaseSensitiveFileNames,
         getCurrentDirectory: () => currentDirectory,
+        resolveInternalFileName: (fileName) => inMemoryFileEntries.get(canonicalizeInternalFileName(fileName, useCaseSensitiveFileNames))?.fileName ?? fileName,
     };
     if (system.realpath) {
-        host.realpath = system.realpath.bind(system);
+        host.realpath = (fileName) => host.resolveInternalFileName(fileName);
     }
     return host;
 }
 function resolveModuleNameWithArkTSFallback(moduleName, containingFile, compilerOptions, resolutionHost) {
     const resolved = ts.resolveModuleName(moduleName, containingFile, compilerOptions, resolutionHost).resolvedModule;
     if (resolved) {
-        return resolved;
+        return {
+            ...resolved,
+            resolvedFileName: resolutionHost.resolveInternalFileName(resolved.resolvedFileName),
+        };
     }
     if (!moduleName.startsWith(".")) {
         return undefined;
     }
-    const containingDirectory = path.dirname(containingFile);
-    const resolvedBase = path.resolve(containingDirectory, moduleName);
+    const pathApi = getPathApiForFileName(containingFile);
+    const containingDirectory = pathApi.dirname(containingFile);
+    const resolvedBase = pathApi.resolve(containingDirectory, moduleName);
     const candidates = [
         `${resolvedBase}.ets`,
         `${resolvedBase}.ts`,
-        path.join(resolvedBase, "index.ets"),
-        path.join(resolvedBase, "index.ts"),
+        pathApi.join(resolvedBase, "index.ets"),
+        pathApi.join(resolvedBase, "index.ts"),
     ];
     for (const candidate of candidates) {
         if (!resolutionHost.fileExists(candidate)) {
             continue;
         }
         const resolvedModule = {
-            resolvedFileName: candidate,
+            resolvedFileName: resolutionHost.resolveInternalFileName(candidate),
             extension: ts.Extension.Ts,
             isExternalLibraryImport: false,
         };
         return resolvedModule;
     }
     return undefined;
+}
+function getPathApiForFileName(fileName) {
+    if (fileName.includes("\\")) {
+        return path.win32;
+    }
+    if (/^(?:[A-Za-z]:|\/\/)/u.test(fileName)) {
+        return path.win32;
+    }
+    return path.posix;
 }
 function currentDirectoryFromSystem(system) {
     return system.getCurrentDirectory();

@@ -333,6 +333,43 @@ struct Home {
   );
 });
 
+test("collectDiagnostics resolves extensionless relative .ets imports for POSIX virtual files on Windows-like systems", () => {
+  const entryFileName = "/virtual/main.ets";
+  const helperFileName = "/virtual/helper.ets";
+  const analyzer = new ArkTSAnalyzer({
+    rootNames: [entryFileName, helperFileName],
+    system: createWindowsLikeSystem("C:\\repo"),
+  });
+
+  analyzer.setInMemoryFile({
+    fileName: helperFileName,
+    content: `export const message = "hello";
+`,
+  });
+
+  analyzer.setInMemoryFile({
+    fileName: entryFileName,
+    content: `import { message } from "./helper";
+
+@ComponentV2
+struct Home {
+  build() {
+    Text(message)
+  }
+}
+`,
+  });
+
+  const diagnostics = analyzer.collectDiagnostics(entryFileName);
+
+  assert.ok(
+    diagnostics.every(
+      (diagnostic) =>
+        !diagnostic.message.includes("Cannot find module './helper'"),
+    ),
+  );
+});
+
 function createWindowsLikeSystem(currentDirectory) {
   return {
     ...ts.sys,

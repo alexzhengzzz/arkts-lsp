@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -1017,7 +1017,16 @@ function collectOverlayEntries(files) {
     return [...overlays.values()];
 }
 function normalizeInputPath(fileName) {
-    return path.normalize(path.isAbsolute(fileName) ? fileName : path.resolve(process.cwd(), fileName));
+    const resolvedPath = path.normalize(path.isAbsolute(fileName) ? fileName : path.resolve(process.cwd(), fileName));
+    if (!existsSync(resolvedPath)) {
+        return resolvedPath;
+    }
+    try {
+        return realpathSync.native?.(resolvedPath) ?? realpathSync(resolvedPath);
+    }
+    catch {
+        return resolvedPath;
+    }
 }
 function dedupePaths(fileNames) {
     return dedupeFileNamesByInternalIdentity(fileNames);
