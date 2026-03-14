@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import ts from "typescript";
 
 import { ArkTSAnalyzer } from "../dist/index.js";
 
@@ -256,6 +257,46 @@ struct Dashboard {
   );
 });
 
+test("findDecoratedComponents matches mixed Windows path spellings through the analyzer host", () => {
+  const rootFileName = "C:\\repo\\virtual\\component-v2-members.ets";
+  const overlayFileName = "c:/repo/virtual/component-v2-members.ets";
+  const analyzer = new ArkTSAnalyzer({
+    rootNames: [rootFileName],
+    system: createWindowsLikeSystem("C:\\repo"),
+  });
+
+  analyzer.setInMemoryFile({
+    fileName: overlayFileName,
+    content: `@ComponentV2
+struct Dashboard {
+  @Param @Require title: string;
+  @Local count: number = 0;
+  @Computed summary: string = "ready";
+
+  build() {}
+
+  @Builder
+  buildFooter() {}
+}
+`,
+  });
+
+  const components = analyzer.findDecoratedComponents(rootFileName);
+
+  assert.equal(components.length, 1);
+  assert.deepEqual(components[0].componentDecorators, ["ComponentV2"]);
+  assert.deepEqual(
+    components[0].decoratedMembers.map((member) => `${member.name}:${member.decorator}:${member.kind}`),
+    [
+      "title:Param:param",
+      "title:Require:require",
+      "count:Local:local",
+      "summary:Computed:computed",
+      "buildFooter:Builder:other",
+    ],
+  );
+});
+
 test("collectDiagnostics resolves extensionless relative .ets imports", () => {
   const entryFileName = "/virtual/main.ets";
   const helperFileName = "/virtual/helper.ets";
@@ -291,6 +332,14 @@ struct Home {
     ),
   );
 });
+
+function createWindowsLikeSystem(currentDirectory) {
+  return {
+    ...ts.sys,
+    useCaseSensitiveFileNames: false,
+    getCurrentDirectory: () => currentDirectory,
+  };
+}
 
 test("findDecoratedComponents identifies core component decorators and decorated members", () => {
   const fileName = "/virtual/components.ets";

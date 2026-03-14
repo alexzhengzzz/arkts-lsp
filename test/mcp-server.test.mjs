@@ -350,6 +350,51 @@ struct Dashboard {
   });
 });
 
+test("arkts_analyze_components matches Windows overlay paths across slash and drive-letter variants", {
+  skip: process.platform !== "win32",
+}, async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "arkts-mcp-windows-components-"));
+
+  try {
+    const source = `@ComponentV2
+struct Dashboard {
+  @Param @Require title: string;
+  @Local count: number = 0;
+  @Computed summary: string = "ready";
+
+  build() {}
+
+  @Builder
+  buildFooter() {}
+}
+`;
+
+    await withClient({ cwd: tempDir }, async (client) => {
+      const relativeTargetFile = path.join("src", "component-v2.ets");
+      const normalizedTargetFile = path.resolve(tempDir, relativeTargetFile);
+      const result = await client.callTool({
+        name: "arkts_analyze_components",
+        arguments: {
+          targetFile: relativeTargetFile,
+          files: [
+            {
+              fileName: toMixedWindowsPath(normalizedTargetFile),
+              content: source,
+            },
+          ],
+        },
+      });
+      const data = getStructuredContent(result);
+
+      assert.equal(data.targetFile, normalizedTargetFile);
+      assert.equal(data.components.length, 1);
+      assert.deepEqual(data.components[0].componentDecorators, ["ComponentV2"]);
+    });
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("arkts_get_diagnostics accepts AI-OHOSAPP-style ComponentV2 UI DSL without compatibility noise", async () => {
   const source = `import { router, curves } from '@kit.ArkUI';
 import { BusinessError } from '@kit.BasicServicesKit';
@@ -871,6 +916,14 @@ function getStructuredContent(result) {
   assert.ok(!("toolResult" in result), "Expected a standard tool result payload.");
   assert.ok(result.structuredContent, "Expected structuredContent in tool result.");
   return result.structuredContent;
+}
+
+function toMixedWindowsPath(fileName) {
+  return fileName
+    .replace(/\\/g, "/")
+    .replace(/^[A-Za-z]:/, (drive) =>
+      drive === drive.toUpperCase() ? drive.toLowerCase() : drive.toUpperCase(),
+    );
 }
 
 function positionOf(source, text, occurrence) {

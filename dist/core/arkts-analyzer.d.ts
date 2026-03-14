@@ -84,6 +84,8 @@ export declare class ArkTSAnalyzer {
     private readonly system;
     private readonly compilerOptions;
     private readonly inMemoryFiles;
+    private readonly inMemoryFileNames;
+    private readonly programFileNames;
     private readonly scriptVersions;
     private rootNames;
     private host;
@@ -130,4 +132,9 @@ export declare class ArkTSAnalyzer {
     private isSupportedSourceFile;
     private bumpScriptVersions;
     private bumpScriptVersion;
+    private refreshProgramFileNames;
+    private resolveKnownFileName;
+    private findRootNameByIdentity;
+    private dedupeFileNames;
+    private getFileIdentity;
 }

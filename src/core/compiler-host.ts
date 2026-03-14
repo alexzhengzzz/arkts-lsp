@@ -19,22 +19,38 @@ export interface ArkTSLanguageServiceHostOptions extends ArkTSCompilerHostOption
   currentDirectory?: string;
 }
 
+interface FileEntry<TValue> {
+  fileName: string;
+  value: TValue;
+}
+
 export function createArkTSCompilerHost(
   compilerOptions: ts.CompilerOptions,
   options: ArkTSCompilerHostOptions = {},
 ): ts.CompilerHost {
   const system = options.system ?? ts.sys;
   const inMemoryFiles = options.inMemoryFiles ?? new Map<string, string>();
+  const useCaseSensitiveFileNames = system.useCaseSensitiveFileNames;
+  const inMemoryFileEntries = indexEntriesByInternalFileName(
+    inMemoryFiles,
+    useCaseSensitiveFileNames,
+  );
   const host = ts.createCompilerHost(compilerOptions, true);
   const originalGetSourceFile = host.getSourceFile.bind(host);
   const originalDirectoryExists = host.directoryExists?.bind(host);
   const originalGetDirectories = host.getDirectories?.bind(host);
-  const resolutionHost = createModuleResolutionHost(system, inMemoryFiles, currentDirectoryFromSystem(system));
+  const resolutionHost = createModuleResolutionHost(
+    system,
+    inMemoryFiles,
+    currentDirectoryFromSystem(system),
+  );
 
   host.fileExists = (fileName) => {
     return (
       isArkTSIntrinsicFile(fileName) ||
-      inMemoryFiles.has(fileName) ||
+      inMemoryFileEntries.has(
+        canonicalizeInternalFileName(fileName, useCaseSensitiveFileNames),
+      ) ||
       system.fileExists(fileName)
     );
   };
@@ -44,12 +60,16 @@ export function createArkTSCompilerHost(
       return getArkTSIntrinsicsSource();
     }
 
-    return inMemoryFiles.get(fileName) ?? system.readFile(fileName);
+    return (
+      inMemoryFileEntries.get(
+        canonicalizeInternalFileName(fileName, useCaseSensitiveFileNames),
+      )?.value ?? system.readFile(fileName)
+    );
   };
 
   host.directoryExists = (directoryName) => {
     return (
-      hasVirtualDirectory(inMemoryFiles, directoryName) ||
+      hasVirtualDirectory(inMemoryFileEntries.values(), directoryName, useCaseSensitiveFileNames) ||
       originalDirectoryExists?.(directoryName) ||
       false
     );
@@ -57,7 +77,11 @@ export function createArkTSCompilerHost(
 
   host.getDirectories = (directoryName) => {
     const systemDirectories = originalGetDirectories?.(directoryName) ?? [];
-    const virtualDirectories = getVirtualDirectories(inMemoryFiles, directoryName);
+    const virtualDirectories = getVirtualDirectories(
+      inMemoryFileEntries.values(),
+      directoryName,
+      useCaseSensitiveFileNames,
+    );
 
     return [...new Set([...systemDirectories, ...virtualDirectories])];
   };
@@ -124,6 +148,15 @@ export function createArkTSLanguageServiceHost(
   const system = options.system ?? ts.sys;
   const inMemoryFiles = options.inMemoryFiles ?? new Map<string, string>();
   const versions = options.versions ?? new Map<string, string>();
+  const useCaseSensitiveFileNames = system.useCaseSensitiveFileNames;
+  const inMemoryFileEntries = indexEntriesByInternalFileName(
+    inMemoryFiles,
+    useCaseSensitiveFileNames,
+  );
+  const versionEntries = indexEntriesByInternalFileName(
+    versions,
+    useCaseSensitiveFileNames,
+  );
   const currentDirectory = options.currentDirectory ?? system.getCurrentDirectory();
   const scriptFileNames = withArkTSIntrinsics(rootNames);
   const resolutionHost = createModuleResolutionHost(system, inMemoryFiles, currentDirectory);
@@ -132,13 +165,21 @@ export function createArkTSLanguageServiceHost(
     getCurrentDirectory: () => currentDirectory,
     getDefaultLibFileName: (settings) => ts.getDefaultLibFilePath(settings),
     getScriptFileNames: () => [...scriptFileNames],
-    getScriptVersion: (fileName) => versions.get(fileName) ?? "0",
+    getScriptVersion: (fileName) =>
+      versionEntries.get(
+        canonicalizeInternalFileName(fileName, useCaseSensitiveFileNames),
+      )?.value ?? "0",
     getScriptKind: (fileName) =>
       isArkTSFile(fileName) || isArkTSIntrinsicFile(fileName)
         ? ts.ScriptKind.TS
         : inferScriptKind(fileName),
     getScriptSnapshot: (fileName) => {
-      const sourceText = readSourceText(fileName, inMemoryFiles, system);
+      const sourceText = readSourceText(
+        fileName,
+        inMemoryFiles,
+        system,
+        useCaseSensitiveFileNames,
+      );
       if (sourceText === undefined) {
         return undefined;
       }
@@ -147,16 +188,23 @@ export function createArkTSLanguageServiceHost(
     },
     fileExists: (fileName) =>
       isArkTSIntrinsicFile(fileName) ||
-      inMemoryFiles.has(fileName) ||
+      inMemoryFileEntries.has(
+        canonicalizeInternalFileName(fileName, useCaseSensitiveFileNames),
+      ) ||
       system.fileExists(fileName),
-    readFile: (fileName) => readSourceText(fileName, inMemoryFiles, system),
+    readFile: (fileName) =>
+      readSourceText(fileName, inMemoryFiles, system, useCaseSensitiveFileNames),
     directoryExists: (directoryName) =>
-      hasVirtualDirectory(inMemoryFiles, directoryName) ||
+      hasVirtualDirectory(inMemoryFileEntries.values(), directoryName, useCaseSensitiveFileNames) ||
       system.directoryExists?.(directoryName) ||
       false,
     getDirectories: (directoryName) => {
       const systemDirectories = system.getDirectories?.(directoryName) ?? [];
-      const virtualDirectories = getVirtualDirectories(inMemoryFiles, directoryName);
+      const virtualDirectories = getVirtualDirectories(
+        inMemoryFileEntries.values(),
+        directoryName,
+        useCaseSensitiveFileNames,
+      );
 
       return [...new Set([...systemDirectories, ...virtualDirectories])];
     },
@@ -196,12 +244,16 @@ function readSourceText(
   fileName: string,
   inMemoryFiles: ReadonlyMap<string, string>,
   system: ts.System,
+  useCaseSensitiveFileNames = system.useCaseSensitiveFileNames,
 ): string | undefined {
   if (isArkTSIntrinsicFile(fileName)) {
     return getArkTSIntrinsicsSource();
   }
 
-  const sourceText = inMemoryFiles.get(fileName) ?? system.readFile(fileName);
+  const sourceText =
+    indexEntriesByInternalFileName(inMemoryFiles, useCaseSensitiveFileNames).get(
+      canonicalizeInternalFileName(fileName, useCaseSensitiveFileNames),
+    )?.value ?? system.readFile(fileName);
   if (sourceText === undefined) {
     return undefined;
   }
@@ -234,19 +286,31 @@ function createModuleResolutionHost(
   inMemoryFiles: ReadonlyMap<string, string>,
   currentDirectory: string,
 ): ts.ModuleResolutionHost {
+  const useCaseSensitiveFileNames = system.useCaseSensitiveFileNames;
+  const inMemoryFileEntries = indexEntriesByInternalFileName(
+    inMemoryFiles,
+    useCaseSensitiveFileNames,
+  );
   const host: ts.ModuleResolutionHost = {
     fileExists: (fileName) =>
       isArkTSIntrinsicFile(fileName) ||
-      inMemoryFiles.has(fileName) ||
+      inMemoryFileEntries.has(
+        canonicalizeInternalFileName(fileName, useCaseSensitiveFileNames),
+      ) ||
       system.fileExists(fileName),
-    readFile: (fileName) => readSourceText(fileName, inMemoryFiles, system),
+    readFile: (fileName) =>
+      readSourceText(fileName, inMemoryFiles, system, useCaseSensitiveFileNames),
     directoryExists: (directoryName) =>
-      hasVirtualDirectory(inMemoryFiles, directoryName) ||
+      hasVirtualDirectory(inMemoryFileEntries.values(), directoryName, useCaseSensitiveFileNames) ||
       system.directoryExists?.(directoryName) ||
       false,
     getDirectories: (directoryName) => {
       const systemDirectories = system.getDirectories?.(directoryName) ?? [];
-      const virtualDirectories = getVirtualDirectories(inMemoryFiles, directoryName);
+      const virtualDirectories = getVirtualDirectories(
+        inMemoryFileEntries.values(),
+        directoryName,
+        useCaseSensitiveFileNames,
+      );
 
       return [...new Set([...systemDirectories, ...virtualDirectories])];
     },
@@ -313,13 +377,20 @@ function currentDirectoryFromSystem(system: ts.System): string {
 }
 
 function hasVirtualDirectory(
-  inMemoryFiles: ReadonlyMap<string, string>,
+  inMemoryFiles: Iterable<FileEntry<unknown>>,
   directoryName: string,
+  useCaseSensitiveFileNames: boolean,
 ): boolean {
-  const normalizedDirectoryName = normalizePath(directoryName);
+  const normalizedDirectoryName = canonicalizeInternalFileName(
+    directoryName,
+    useCaseSensitiveFileNames,
+  );
 
-  for (const fileName of inMemoryFiles.keys()) {
-    const normalizedFileName = normalizePath(fileName);
+  for (const file of inMemoryFiles) {
+    const normalizedFileName = canonicalizeInternalFileName(
+      file.fileName,
+      useCaseSensitiveFileNames,
+    );
 
     if (isSameOrWithinDirectory(normalizedFileName, normalizedDirectoryName)) {
       return true;
@@ -330,14 +401,21 @@ function hasVirtualDirectory(
 }
 
 function getVirtualDirectories(
-  inMemoryFiles: ReadonlyMap<string, string>,
+  inMemoryFiles: Iterable<FileEntry<unknown>>,
   directoryName: string,
+  useCaseSensitiveFileNames: boolean,
 ): string[] {
-  const normalizedDirectoryName = normalizePath(directoryName);
+  const normalizedDirectoryName = canonicalizeInternalFileName(
+    directoryName,
+    useCaseSensitiveFileNames,
+  );
   const directories = new Set<string>();
 
-  for (const fileName of inMemoryFiles.keys()) {
-    const normalizedFileName = normalizePath(fileName);
+  for (const file of inMemoryFiles) {
+    const normalizedFileName = canonicalizeInternalFileName(
+      file.fileName,
+      useCaseSensitiveFileNames,
+    );
     if (!isSameOrWithinDirectory(normalizedFileName, normalizedDirectoryName)) {
       continue;
     }
@@ -357,8 +435,65 @@ function getVirtualDirectories(
   return [...directories];
 }
 
-function normalizePath(fileName: string): string {
-  return fileName.replace(/\\/g, "/").replace(/\/+$/, "") || "/";
+export function canonicalizeInternalFileName(
+  fileName: string,
+  useCaseSensitiveFileNames = ts.sys.useCaseSensitiveFileNames,
+): string {
+  if (isArkTSIntrinsicFile(fileName)) {
+    return ARKTS_INTRINSICS_FILE_NAME;
+  }
+
+  const normalizedPath = path.normalize(fileName).replace(/\\/g, "/") || "/";
+  const root = getPathRoot(normalizedPath);
+  const canonicalPath =
+    normalizedPath.length > root.length
+      ? normalizedPath.replace(/\/+$/, "")
+      : normalizedPath;
+
+  return useCaseSensitiveFileNames ? canonicalPath : canonicalPath.toLowerCase();
+}
+
+export function dedupeFileNamesByInternalIdentity(
+  fileNames: readonly string[],
+  useCaseSensitiveFileNames = ts.sys.useCaseSensitiveFileNames,
+): string[] {
+  return [...indexEntriesByInternalFileName(
+    fileNames.map((fileName) => [fileName, fileName] as const),
+    useCaseSensitiveFileNames,
+  ).values()].map((entry) => entry.fileName);
+}
+
+function getPathRoot(fileName: string): string {
+  const uncRoot = fileName.match(/^\/\/[^/]+\/[^/]+\/?/u)?.[0];
+  if (uncRoot) {
+    return uncRoot;
+  }
+
+  const driveRoot = fileName.match(/^[A-Za-z]:\/?/u)?.[0];
+  if (driveRoot) {
+    return driveRoot.endsWith("/") ? driveRoot : `${driveRoot}/`;
+  }
+
+  return fileName.startsWith("/") ? "/" : "";
+}
+
+function indexEntriesByInternalFileName<TValue>(
+  entries: Iterable<readonly [string, TValue]>,
+  useCaseSensitiveFileNames: boolean,
+): Map<string, FileEntry<TValue>> {
+  const indexedEntries = new Map<string, FileEntry<TValue>>();
+
+  for (const [fileName, value] of entries) {
+    indexedEntries.set(
+      canonicalizeInternalFileName(fileName, useCaseSensitiveFileNames),
+      {
+        fileName,
+        value,
+      },
+    );
+  }
+
+  return indexedEntries;
 }
 
 function joinNormalizedPath(directoryName: string, segment: string): string {

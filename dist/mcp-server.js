@@ -5,6 +5,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import * as z from "zod/v4";
 import { ArkTSAnalyzer, } from "./core/arkts-analyzer.js";
+import { canonicalizeInternalFileName, dedupeFileNamesByInternalIdentity, } from "./core/compiler-host.js";
 import { WorkspaceService } from "./workspace/workspace-service.js";
 const serverInfo = {
     name: "arkts-analyzer-mcp",
@@ -971,8 +972,9 @@ export async function main() {
 function createRequestContext(input) {
     const targetFile = normalizeInputPath(input.targetFile);
     const overlayEntries = collectOverlayEntries(input.files);
-    const overlayFiles = new Set(overlayEntries.map(([fileName]) => fileName));
-    if (!overlayFiles.has(targetFile) && !existsSync(targetFile)) {
+    const targetFileIdentity = canonicalizeInternalFileName(targetFile);
+    const overlayFiles = new Set(overlayEntries.map(([fileName]) => canonicalizeInternalFileName(fileName)));
+    if (!overlayFiles.has(targetFileIdentity) && !existsSync(targetFile)) {
         throw new Error(`Target file does not exist: ${targetFile}`);
     }
     const rootNames = dedupePaths([
@@ -1006,15 +1008,19 @@ async function createWorkspaceService(input) {
 function collectOverlayEntries(files) {
     const overlays = new Map();
     for (const file of files ?? []) {
-        overlays.set(normalizeInputPath(file.fileName), file.content);
+        const normalizedFileName = normalizeInputPath(file.fileName);
+        overlays.set(canonicalizeInternalFileName(normalizedFileName), [
+            normalizedFileName,
+            file.content,
+        ]);
     }
-    return [...overlays.entries()];
+    return [...overlays.values()];
 }
 function normalizeInputPath(fileName) {
     return path.normalize(path.isAbsolute(fileName) ? fileName : path.resolve(process.cwd(), fileName));
 }
 function dedupePaths(fileNames) {
-    return [...new Set(fileNames)];
+    return dedupeFileNamesByInternalIdentity(fileNames);
 }
 function toAnalyzerPosition(position) {
     return {

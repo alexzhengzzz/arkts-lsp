@@ -9,3 +9,5 @@ export interface ArkTSLanguageServiceHostOptions extends ArkTSCompilerHostOption
 }
 export declare function createArkTSCompilerHost(compilerOptions: ts.CompilerOptions, options?: ArkTSCompilerHostOptions): ts.CompilerHost;
 export declare function createArkTSLanguageServiceHost(rootNames: readonly string[], compilerOptions: ts.CompilerOptions, options?: ArkTSLanguageServiceHostOptions): ts.LanguageServiceHost;
+export declare function canonicalizeInternalFileName(fileName: string, useCaseSensitiveFileNames?: boolean): string;
+export declare function dedupeFileNamesByInternalIdentity(fileNames: readonly string[], useCaseSensitiveFileNames?: boolean): string[];

@@ -20,6 +20,10 @@ import {
   type ReferenceLocation,
   type StateMemberInfo,
 } from "./core/arkts-analyzer.js";
+import {
+  canonicalizeInternalFileName,
+  dedupeFileNamesByInternalIdentity,
+} from "./core/compiler-host.js";
 import { WorkspaceService } from "./workspace/workspace-service.js";
 
 interface WorkspaceFileInput {
@@ -1385,9 +1389,12 @@ export async function main(): Promise<void> {
 function createRequestContext(input: WorkspaceToolInput): RequestContext {
   const targetFile = normalizeInputPath(input.targetFile);
   const overlayEntries = collectOverlayEntries(input.files);
-  const overlayFiles = new Set(overlayEntries.map(([fileName]) => fileName));
+  const targetFileIdentity = canonicalizeInternalFileName(targetFile);
+  const overlayFiles = new Set(
+    overlayEntries.map(([fileName]) => canonicalizeInternalFileName(fileName)),
+  );
 
-  if (!overlayFiles.has(targetFile) && !existsSync(targetFile)) {
+  if (!overlayFiles.has(targetFileIdentity) && !existsSync(targetFile)) {
     throw new Error(`Target file does not exist: ${targetFile}`);
   }
 
@@ -1431,13 +1438,17 @@ async function createWorkspaceService(
 function collectOverlayEntries(
   files: WorkspaceFileInput[] | undefined,
 ): Array<[string, string]> {
-  const overlays = new Map<string, string>();
+  const overlays = new Map<string, [string, string]>();
 
   for (const file of files ?? []) {
-    overlays.set(normalizeInputPath(file.fileName), file.content);
+    const normalizedFileName = normalizeInputPath(file.fileName);
+    overlays.set(canonicalizeInternalFileName(normalizedFileName), [
+      normalizedFileName,
+      file.content,
+    ]);
   }
 
-  return [...overlays.entries()];
+  return [...overlays.values()];
 }
 
 function normalizeInputPath(fileName: string): string {
@@ -1447,7 +1458,7 @@ function normalizeInputPath(fileName: string): string {
 }
 
 function dedupePaths(fileNames: string[]): string[] {
-  return [...new Set(fileNames)];
+  return dedupeFileNamesByInternalIdentity(fileNames);
 }
 
 function toAnalyzerPosition(position: ExternalPosition): AnalyzerPosition {

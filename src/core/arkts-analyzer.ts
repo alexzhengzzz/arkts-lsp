@@ -1,7 +1,9 @@
 import ts from "typescript";
 import {
+  canonicalizeInternalFileName,
   createArkTSCompilerHost,
   createArkTSLanguageServiceHost,
+  dedupeFileNamesByInternalIdentity,
 } from "./compiler-host.js";
 import {
   ARKTS_COMPONENT_DECORATOR,
@@ -148,6 +150,8 @@ export class ArkTSAnalyzer {
   private readonly system: ts.System;
   private readonly compilerOptions: ts.CompilerOptions;
   private readonly inMemoryFiles = new Map<string, string>();
+  private readonly inMemoryFileNames = new Map<string, string>();
+  private readonly programFileNames = new Map<string, string>();
   private readonly scriptVersions = new Map<string, string>();
 
   private rootNames: string[];
@@ -170,23 +174,32 @@ export class ArkTSAnalyzer {
       ...options.compilerOptions,
     };
 
-    this.rootNames = options.rootNames ?? [];
+    this.rootNames = this.dedupeFileNames(options.rootNames ?? []);
     this.host = this.createHost();
     this.program = this.createProgram(this.rootNames);
     this.languageService = this.createLanguageService();
+    this.refreshProgramFileNames();
     this.bumpScriptVersions(withArkTSIntrinsics(this.rootNames));
   }
 
   public setRootNames(rootNames: string[]): void {
-    this.rootNames = [...rootNames];
+    this.rootNames = this.dedupeFileNames(rootNames);
     this.rebuildProgram(withArkTSIntrinsics(this.rootNames));
   }
 
   public setInMemoryFile(input: AnalyzeTextInput): void {
+    const fileIdentity = this.getFileIdentity(input.fileName);
+    const existingFileName = this.inMemoryFileNames.get(fileIdentity);
+
+    if (existingFileName) {
+      this.inMemoryFiles.delete(existingFileName);
+    }
+
     this.inMemoryFiles.set(input.fileName, input.content);
+    this.inMemoryFileNames.set(fileIdentity, input.fileName);
     this.bumpScriptVersion(input.fileName);
 
-    if (!this.rootNames.includes(input.fileName)) {
+    if (!this.findRootNameByIdentity(input.fileName)) {
       this.rootNames = [...this.rootNames, input.fileName];
     }
 
@@ -194,7 +207,11 @@ export class ArkTSAnalyzer {
   }
 
   public removeInMemoryFile(fileName: string): void {
-    this.inMemoryFiles.delete(fileName);
+    const fileIdentity = this.getFileIdentity(fileName);
+    const existingFileName = this.inMemoryFileNames.get(fileIdentity) ?? fileName;
+
+    this.inMemoryFiles.delete(existingFileName);
+    this.inMemoryFileNames.delete(fileIdentity);
     this.bumpScriptVersion(fileName);
     this.rebuildProgram();
   }
@@ -204,10 +221,12 @@ export class ArkTSAnalyzer {
     changedFiles?: readonly string[];
     removedFiles?: readonly string[];
   }): void {
-    const previousRootNames = new Set(this.rootNames);
-    const nextRootNames = dedupeFileNames(input.rootNames);
-    const addedFiles = nextRootNames.filter((fileName) => !previousRootNames.has(fileName));
-    const changedFileNames = dedupeFileNames([
+    const previousRootNames = new Set(this.rootNames.map((fileName) => this.getFileIdentity(fileName)));
+    const nextRootNames = this.dedupeFileNames(input.rootNames);
+    const addedFiles = nextRootNames.filter(
+      (fileName) => !previousRootNames.has(this.getFileIdentity(fileName)),
+    );
+    const changedFileNames = this.dedupeFileNames([
       ...(input.changedFiles ?? []),
       ...(input.removedFiles ?? []),
       ...addedFiles,
@@ -224,7 +243,8 @@ export class ArkTSAnalyzer {
   }
 
   public getSourceFile(fileName: string): ts.SourceFile | undefined {
-    return this.program.getSourceFile(fileName);
+    const resolvedFileName = this.resolveKnownFileName(fileName);
+    return resolvedFileName ? this.program.getSourceFile(resolvedFileName) : undefined;
   }
 
   public collectDiagnostics(fileName?: string): AnalyzerDiagnostic[] {
@@ -296,8 +316,8 @@ export class ArkTSAnalyzer {
     fileName: string,
     position: AnalyzerPosition,
   ): HoverInfo | undefined {
-    const sourceFile = this.program.getSourceFile(fileName);
     const symbolContext = this.getResolvedSymbolContext(fileName, position);
+    const sourceFile = symbolContext?.sourceFile;
     if (!sourceFile || !symbolContext) {
       return undefined;
     }
@@ -307,7 +327,10 @@ export class ArkTSAnalyzer {
       position.line,
       position.character,
     );
-    const quickInfo = this.languageService.getQuickInfoAtPosition(fileName, offset);
+    const quickInfo = this.languageService.getQuickInfoAtPosition(
+      symbolContext.requestingFileName,
+      offset,
+    );
     if (!quickInfo) {
       return undefined;
     }
@@ -335,8 +358,8 @@ export class ArkTSAnalyzer {
     fileName: string,
     position: AnalyzerPosition,
   ): ReferenceLocation[] {
-    const sourceFile = this.program.getSourceFile(fileName);
     const symbolContext = this.getResolvedSymbolContext(fileName, position);
+    const sourceFile = symbolContext?.sourceFile;
     if (!sourceFile || !symbolContext) {
       return [];
     }
@@ -346,8 +369,13 @@ export class ArkTSAnalyzer {
       position.line,
       position.character,
     );
-    const references = this.languageService.getReferencesAtPosition(fileName, offset) ?? [];
-    const referenceGroups = this.languageService.findReferences(fileName, offset) ?? [];
+    const references =
+      this.languageService.getReferencesAtPosition(
+        symbolContext.requestingFileName,
+        offset,
+      ) ?? [];
+    const referenceGroups =
+      this.languageService.findReferences(symbolContext.requestingFileName, offset) ?? [];
     const definitionKeys = new Set<string>();
 
     for (const group of referenceGroups) {
@@ -397,12 +425,15 @@ export class ArkTSAnalyzer {
   }
 
   public getDocumentSymbols(fileName: string): DocumentSymbol[] {
-    const sourceFile = this.program.getSourceFile(fileName);
+    const resolvedFileName = this.resolveKnownFileName(fileName);
+    const sourceFile = resolvedFileName
+      ? this.program.getSourceFile(resolvedFileName)
+      : undefined;
     if (!sourceFile) {
       return [];
     }
 
-    const navigationTree = this.languageService.getNavigationTree(fileName);
+    const navigationTree = this.languageService.getNavigationTree(sourceFile.fileName);
     let rootItems = navigationTree.kind === ts.ScriptElementKind.scriptElement
       ? navigationTree.childItems ?? []
       : [navigationTree];
@@ -420,6 +451,7 @@ export class ArkTSAnalyzer {
     this.host = this.createHost();
     this.program = this.createProgram(this.rootNames);
     this.languageService = this.createLanguageService();
+    this.refreshProgramFileNames();
     if (changedFileNames) {
       this.bumpScriptVersions(changedFileNames);
     } else {
@@ -436,9 +468,9 @@ export class ArkTSAnalyzer {
 
   private createLanguageService(): ts.LanguageService {
     const host = createArkTSLanguageServiceHost(
-      dedupeFileNames([
+      this.dedupeFileNames([
         ...this.rootNames,
-        ...this.inMemoryFiles.keys(),
+        ...this.inMemoryFileNames.values(),
       ]),
       this.compilerOptions,
       {
@@ -461,12 +493,13 @@ export class ArkTSAnalyzer {
   }
 
   private collectLexicalDiagnostics(fileName: string): AnalyzerDiagnostic[] {
-    const sourceText = this.readFileText(fileName);
+    const resolvedFileName = this.resolveKnownFileName(fileName) ?? fileName;
+    const sourceText = this.readFileText(resolvedFileName);
     if (sourceText === undefined) {
       return [];
     }
 
-    const normalizedText = normalizeArkTSSource(fileName, sourceText);
+    const normalizedText = normalizeArkTSSource(resolvedFileName, sourceText);
     const lexicalDiagnostics: AnalyzerDiagnostic[] = [];
     const scanner = ts.createScanner(
       this.compilerOptions.target ?? ts.ScriptTarget.ES2022,
@@ -476,7 +509,7 @@ export class ArkTSAnalyzer {
       (message, length) => {
         const start = scanner.getTokenStart();
         lexicalDiagnostics.push({
-          fileName,
+          fileName: resolvedFileName,
           category: "lexical",
           code: message.code,
           message: ts.flattenDiagnosticMessageText(message.message, "\n"),
@@ -675,7 +708,12 @@ export class ArkTSAnalyzer {
 
   private getTargetFileNames(fileName?: string): string[] {
     if (fileName) {
-      return isArkTSIntrinsicFile(fileName) ? [] : [fileName];
+      if (isArkTSIntrinsicFile(fileName)) {
+        return [];
+      }
+
+      const resolvedFileName = this.resolveKnownFileName(fileName);
+      return resolvedFileName ? [resolvedFileName] : [fileName];
     }
 
     const fileNames = new Set<string>();
@@ -696,7 +734,13 @@ export class ArkTSAnalyzer {
   }
 
   private readFileText(fileName: string): string | undefined {
-    return this.inMemoryFiles.get(fileName) ?? this.system.readFile(fileName);
+    const fileIdentity = this.getFileIdentity(fileName);
+    const inMemoryFileName = this.inMemoryFileNames.get(fileIdentity);
+
+    return (
+      (inMemoryFileName ? this.inMemoryFiles.get(inMemoryFileName) : undefined) ??
+      this.system.readFile(fileName)
+    );
   }
 
   private getResolvedSymbolContext(
@@ -708,7 +752,10 @@ export class ArkTSAnalyzer {
     offset: number;
     requestingFileName: string;
   } | undefined {
-    const sourceFile = this.program.getSourceFile(fileName);
+    const resolvedFileName = this.resolveKnownFileName(fileName);
+    const sourceFile = resolvedFileName
+      ? this.program.getSourceFile(resolvedFileName)
+      : undefined;
     if (!sourceFile) {
       return undefined;
     }
@@ -729,7 +776,7 @@ export class ArkTSAnalyzer {
       return undefined;
     }
 
-    const declaration = this.selectDefinitionDeclaration(symbol, fileName);
+    const declaration = this.selectDefinitionDeclaration(symbol, sourceFile.fileName);
     if (!declaration) {
       return undefined;
     }
@@ -738,7 +785,7 @@ export class ArkTSAnalyzer {
       symbol,
       sourceFile,
       offset,
-      requestingFileName: fileName,
+      requestingFileName: sourceFile.fileName,
     };
   }
 
@@ -750,13 +797,12 @@ export class ArkTSAnalyzer {
       offset: number,
     ) => readonly ts.DocumentSpan[],
   ): DefinitionLocation[] {
-    const sourceFile = this.program.getSourceFile(fileName);
     const symbolContext = this.getResolvedSymbolContext(fileName, position);
-    if (!sourceFile || !symbolContext) {
+    if (!symbolContext) {
       return [];
     }
 
-    const locations = getLocations(fileName, symbolContext.offset)
+    const locations = getLocations(symbolContext.requestingFileName, symbolContext.offset)
       .filter((location) => this.isSupportedSourceFile(location.fileName))
       .map((location) => this.toDefinitionLocationFromSpan(location))
       .filter((location): location is DefinitionLocation => location !== undefined);
@@ -890,7 +936,7 @@ export class ArkTSAnalyzer {
       return false;
     }
 
-    const sourceFile = this.program.getSourceFile(fileName);
+    const sourceFile = this.getSourceFile(fileName);
     return sourceFile !== undefined && !this.program.isSourceFileDefaultLibrary(sourceFile);
   }
 
@@ -901,8 +947,45 @@ export class ArkTSAnalyzer {
   }
 
   private bumpScriptVersion(fileName: string): void {
-    const currentVersion = Number(this.scriptVersions.get(fileName) ?? "0");
-    this.scriptVersions.set(fileName, String(currentVersion + 1));
+    const fileIdentity = this.getFileIdentity(fileName);
+    const currentVersion = Number(this.scriptVersions.get(fileIdentity) ?? "0");
+    this.scriptVersions.set(fileIdentity, String(currentVersion + 1));
+  }
+
+  private refreshProgramFileNames(): void {
+    this.programFileNames.clear();
+
+    for (const rootName of this.rootNames) {
+      this.programFileNames.set(this.getFileIdentity(rootName), rootName);
+    }
+
+    for (const fileName of this.inMemoryFileNames.values()) {
+      this.programFileNames.set(this.getFileIdentity(fileName), fileName);
+    }
+
+    for (const sourceFile of this.program.getSourceFiles()) {
+      this.programFileNames.set(this.getFileIdentity(sourceFile.fileName), sourceFile.fileName);
+    }
+  }
+
+  private resolveKnownFileName(fileName: string): string | undefined {
+    return this.programFileNames.get(this.getFileIdentity(fileName));
+  }
+
+  private findRootNameByIdentity(fileName: string): string | undefined {
+    const fileIdentity = this.getFileIdentity(fileName);
+    return this.rootNames.find((rootName) => this.getFileIdentity(rootName) === fileIdentity);
+  }
+
+  private dedupeFileNames(fileNames: readonly string[]): string[] {
+    return dedupeFileNamesByInternalIdentity(
+      [...fileNames],
+      this.system.useCaseSensitiveFileNames,
+    );
+  }
+
+  private getFileIdentity(fileName: string): string {
+    return canonicalizeInternalFileName(fileName, this.system.useCaseSensitiveFileNames);
   }
 }
 
@@ -1179,10 +1262,6 @@ function getDiagnosticConfidence(
       ? "Unresolved symbol outside the ArkTS compatibility allowlist."
       : "Produced by the TypeScript semantic/syntactic pipeline.",
   };
-}
-
-function dedupeFileNames(fileNames: Iterable<string>): string[] {
-  return [...new Set(fileNames)];
 }
 
 function dedupeDefinitionLocations(
