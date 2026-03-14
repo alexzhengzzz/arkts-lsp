@@ -1,12 +1,8 @@
 import { type DefinitionLocation, type DocumentSymbol, type HoverInfo, type ReferenceLocation, type AnalyzerPosition } from "../core/arkts-analyzer.js";
 import type { ContextBundle, DependencyTrace, EvidenceContextResult, ExplainModuleResult, ExternalRange, FileSummary, FindSymbolOptions, FindSymbolResult, ReadSourceExcerptResult, RefreshResult, RelatedFilesOptions, TraceDependenciesOptions, WorkspaceOverview, WorkspaceOverlayFile, WorkspaceServiceOptions } from "./types.js";
 interface EvidenceContextOptions {
-    targetFile?: string | undefined;
-    symbolQuery?: string | undefined;
+    targetFile: string;
     question?: string | undefined;
-    includeRelated?: boolean | undefined;
-    snippetCount?: number | undefined;
-    budgetChars?: number | undefined;
 }
 export declare class WorkspaceService {
     private readonly workspaceRoot;
@@ -42,8 +38,12 @@ export declare class WorkspaceService {
     getDocumentSymbols(fileName: string, overlays?: WorkspaceOverlayFile[]): DocumentSymbol[];
     readSourceExcerpt(input: {
         targetFile: string;
-        range?: ExternalRange;
-        symbolQuery?: string;
+        range: ExternalRange;
+        maxLines?: number;
+    }, overlays?: WorkspaceOverlayFile[]): Promise<ReadSourceExcerptResult>;
+    readSymbolExcerpt(input: {
+        targetFile: string;
+        symbolQuery: string;
         maxLines?: number;
     }, overlays?: WorkspaceOverlayFile[]): Promise<ReadSourceExcerptResult>;
     getEvidenceContext(options: EvidenceContextOptions, overlays?: WorkspaceOverlayFile[]): Promise<EvidenceContextResult>;
@@ -68,7 +68,6 @@ export declare class WorkspaceService {
     private persistSnapshot;
     private loadPersistedSnapshot;
     private createContextFile;
-    private resolveTargetFile;
     private resolveWorkspacePath;
     private requireSnapshot;
     private getFileSummaryForPath;

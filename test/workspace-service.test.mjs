@@ -37,6 +37,33 @@ test("WorkspaceService builds a persisted workspace snapshot and reuses it on th
   }
 });
 
+test("WorkspaceService reuses the same snapshot when include/exclude patterns are reordered", async () => {
+  const workspace = await createWorkspaceFixture("arkts-workspace-pattern-cache-");
+  const cacheDir = path.join(workspace.root, ".cache-test");
+
+  try {
+    WorkspaceService.resetForTests();
+    const service = await WorkspaceService.initialize(workspace.root, {
+      cacheDir,
+      include: ["src/**/*.ets", "src/**/*.ts"],
+      exclude: ["node_modules/**", "dist/**"],
+    });
+    assert.equal(service.getOverview().cacheStatus, "rebuilt");
+
+    WorkspaceService.resetForTests();
+    const cachedService = await WorkspaceService.initialize(workspace.root, {
+      cacheDir,
+      include: [" src/**/*.ts ", "src/**/*.ets", "src/**/*.ts"],
+      exclude: ["dist/**", "node_modules/**", "dist/**"],
+    });
+
+    assert.equal(cachedService.getOverview().cacheStatus, "hit");
+  } finally {
+    WorkspaceService.resetForTests();
+    await rm(workspace.root, { recursive: true, force: true });
+  }
+});
+
 test("WorkspaceService summarizes overlay content, returns related files, and refreshes after on-disk changes", async () => {
   const workspace = await createWorkspaceFixture("arkts-workspace-refresh-");
   const cacheDir = path.join(workspace.root, ".cache-test");

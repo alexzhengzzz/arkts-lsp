@@ -1,0 +1,6 @@
+{
+  "workspaceRoot": ".",
+  "maxFiles": 2000,
+  "cacheDir": ".cache/arkts-analyzer",
+  "freshness": "mtime"
+}

@@ -6,6 +6,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import * as z from "zod/v4";
 import { ArkTSAnalyzer, } from "./core/arkts-analyzer.js";
 import { canonicalizeInternalFileName, dedupeFileNamesByInternalIdentity, } from "./core/compiler-host.js";
+import { resolveMcpServerConfig, } from "./mcp-config.js";
 import { WorkspaceService } from "./workspace/workspace-service.js";
 const serverInfo = {
     name: "arkts-analyzer-mcp",
@@ -25,55 +26,70 @@ const workspaceFileSchema = z.object({
     fileName: z.string().min(1).describe("Absolute or cwd-relative file path."),
     content: z.string().describe("Unsaved in-memory file contents."),
 });
-const workspaceInputSchema = {
+const analyzerInputSchema = z.strictObject({
     targetFile: z
         .string()
         .min(1)
         .describe("Absolute or cwd-relative path to the file being analyzed."),
-    rootNames: z
-        .array(z.string().min(1))
-        .optional()
-        .describe("Optional extra root files to include in the analysis program."),
     files: z
         .array(workspaceFileSchema)
         .optional()
         .describe("Optional in-memory file overlays. Later duplicates win."),
-};
-const workspaceServiceInputSchema = {
-    workspaceRoot: z
+});
+const emptyInputSchema = z.strictObject({});
+const workspaceTargetFileInputSchema = z.strictObject({
+    targetFile: z
         .string()
         .min(1)
-        .optional()
-        .describe("Workspace root path. Defaults to the current working directory."),
-    include: z
-        .array(z.string().min(1))
-        .optional()
-        .describe("Optional include globs for workspace discovery."),
-    exclude: z
-        .array(z.string().min(1))
-        .optional()
-        .describe("Optional exclude globs for workspace discovery."),
-    maxFiles: z
-        .union([z.number().int().positive(), z.null()])
-        .optional()
-        .describe("Maximum number of workspace files to index. Use null to disable the cap."),
-    cacheDir: z
+        .describe("Absolute or workspace-relative path to the file being analyzed."),
+});
+const workspaceSymbolInputSchema = z.strictObject({
+    query: z.string().min(1).describe("Workspace symbol query."),
+});
+const relatedFilesInputSchema = z.strictObject({
+    targetFile: z
         .string()
         .min(1)
-        .optional()
-        .describe("Optional cache directory for persisted workspace snapshots."),
-    freshness: z
-        .enum(["mtime", "always"])
-        .optional()
-        .describe("Cache freshness policy. 'mtime' reuses cache until file metadata changes."),
-};
-const workspaceScopedInputSchema = {
-    ...workspaceServiceInputSchema,
-    files: z
-        .array(workspaceFileSchema)
-        .optional()
-        .describe("Optional in-memory file overlays for query-time analysis."),
-};
+        .describe("Absolute or workspace-relative path to the file being analyzed."),
+    limit: z.number().int().positive().max(20).optional(),
+});
+const traceDependenciesInputSchema = z.strictObject({
+    targetFile: z
+        .string()
+        .min(1)
+        .describe("Absolute or workspace-relative path to the file being analyzed."),
+    depth: z.number().int().positive().max(5).optional(),
+});
+const workspacePositionInputSchema = z.strictObject({
+    targetFile: z
+        .string()
+        .min(1)
+        .describe("Absolute or workspace-relative path to the file being analyzed."),
+    position: positionSchema,
+});
+const readSourceExcerptInputSchema = z.strictObject({
+    targetFile: z
+        .string()
+        .min(1)
+        .describe("Absolute or workspace-relative path to the file being analyzed."),
+    range: rangeSchema,
+    maxLines: z.number().int().positive().max(200).optional(),
+});
+const readSymbolExcerptInputSchema = z.strictObject({
+    targetFile: z
+        .string()
+        .min(1)
+        .describe("Absolute or workspace-relative path to the file being analyzed."),
+    symbolQuery: z.string().min(1).describe("Symbol name to locate inside the target file."),
+    maxLines: z.number().int().positive().max(200).optional(),
+});
+const evidenceContextInputSchema = z.strictObject({
+    targetFile: z
+        .string()
+        .min(1)
+        .describe("Absolute or workspace-relative path to the file being analyzed."),
+    question: z.string().min(1).optional(),
+});
 const componentOutputSchema = {
     targetFile: z.string(),
     components: z.array(z.object({
@@ -374,19 +390,20 @@ const evidenceContextOutputSchema = {
     truncated: z.boolean(),
     provenance: provenanceSchema,
 };
-export function createArkTSMcpServer() {
+export function createArkTSMcpServer(serverConfig = resolveMcpServerConfig()) {
     const server = new McpServer(serverInfo);
+    const getWorkspaceService = async () => WorkspaceService.initialize(serverConfig.workspaceRoot, serverConfig.serviceOptions);
     server.registerTool("arkts_workspace_overview", {
         title: "Get ArkTS Workspace Overview",
         description: "Build or load a workspace snapshot and return a bounded repo-map overview for LLM code reading.",
-        inputSchema: workspaceServiceInputSchema,
+        inputSchema: emptyInputSchema,
         outputSchema: workspaceOverviewOutputSchema,
         annotations: {
             readOnlyHint: true,
         },
-    }, async (input) => {
+    }, async () => {
         try {
-            const service = await createWorkspaceService(input);
+            const service = await getWorkspaceService();
             const overview = service.getOverview();
             return {
                 content: [
@@ -405,18 +422,15 @@ export function createArkTSMcpServer() {
     server.registerTool("arkts_summarize_file", {
         title: "Summarize ArkTS File",
         description: "Return a structured file summary with imports, exports, top-level symbols, and ArkTS component facts.",
-        inputSchema: {
-            ...workspaceScopedInputSchema,
-            targetFile: z.string().min(1),
-        },
+        inputSchema: workspaceTargetFileInputSchema,
         outputSchema: fileSummarySchema.shape,
         annotations: {
             readOnlyHint: true,
         },
     }, async (input) => {
         try {
-            const service = await createWorkspaceService(input);
-            const file = await service.summarizeFile(input.targetFile, input.files);
+            const service = await getWorkspaceService();
+            const file = await service.summarizeFile(input.targetFile);
             return {
                 content: [
                     {
@@ -434,21 +448,15 @@ export function createArkTSMcpServer() {
     server.registerTool("arkts_find_symbol", {
         title: "Find Workspace Symbol",
         description: "Search the workspace symbol index using a fuzzy symbol name query.",
-        inputSchema: {
-            ...workspaceServiceInputSchema,
-            query: z.string().min(1),
-            limit: z.number().int().positive().max(50).optional(),
-        },
+        inputSchema: workspaceSymbolInputSchema,
         outputSchema: findSymbolOutputSchema,
         annotations: {
             readOnlyHint: true,
         },
     }, async (input) => {
         try {
-            const service = await createWorkspaceService(input);
-            const result = service.findSymbol(input.query, {
-                limit: input.limit,
-            });
+            const service = await getWorkspaceService();
+            const result = service.findSymbol(input.query);
             return {
                 content: [
                     {
@@ -467,25 +475,19 @@ export function createArkTSMcpServer() {
     });
     server.registerTool("arkts_get_related_files", {
         title: "Get Related Files",
-        description: "Return a compact context bundle with the minimum related files around a target file or symbol query.",
-        inputSchema: {
-            ...workspaceScopedInputSchema,
-            targetFile: z.string().min(1).optional(),
-            symbolQuery: z.string().min(1).optional(),
-            limit: z.number().int().positive().max(20).optional(),
-        },
+        description: "Return a compact context bundle with the minimum related files around a target file.",
+        inputSchema: relatedFilesInputSchema,
         outputSchema: contextBundleOutputSchema,
         annotations: {
             readOnlyHint: true,
         },
     }, async (input) => {
         try {
-            const service = await createWorkspaceService(input);
+            const service = await getWorkspaceService();
             const result = await service.getRelatedFiles({
-                ...(input.targetFile ? { targetFile: input.targetFile } : {}),
-                ...(input.symbolQuery ? { symbolQuery: input.symbolQuery } : {}),
+                targetFile: input.targetFile,
                 ...(input.limit !== undefined ? { limit: input.limit } : {}),
-            }, input.files);
+            });
             return {
                 content: [
                     {
@@ -503,18 +505,15 @@ export function createArkTSMcpServer() {
     server.registerTool("arkts_explain_module", {
         title: "Explain ArkTS Module",
         description: "Return a file summary plus its local dependency neighborhood for quick module comprehension.",
-        inputSchema: {
-            ...workspaceScopedInputSchema,
-            targetFile: z.string().min(1),
-        },
+        inputSchema: workspaceTargetFileInputSchema,
         outputSchema: explainModuleOutputSchema,
         annotations: {
             readOnlyHint: true,
         },
     }, async (input) => {
         try {
-            const service = await createWorkspaceService(input);
-            const result = await service.explainModule(input.targetFile, input.files);
+            const service = await getWorkspaceService();
+            const result = await service.explainModule(input.targetFile);
             return {
                 content: [
                     {
@@ -531,27 +530,50 @@ export function createArkTSMcpServer() {
     });
     server.registerTool("arkts_read_source_excerpt", {
         title: "Read ArkTS Source Excerpt",
-        description: "Return a precise source excerpt for a file range or symbol query with line-aware bounds.",
-        inputSchema: {
-            ...workspaceScopedInputSchema,
-            targetFile: z.string().min(1),
-            range: rangeSchema.optional(),
-            symbolQuery: z.string().min(1).optional(),
-            maxLines: z.number().int().positive().max(200).optional(),
-        },
+        description: "Return a precise source excerpt for an explicit file range with line-aware bounds.",
+        inputSchema: readSourceExcerptInputSchema,
         outputSchema: readSourceExcerptOutputSchema,
         annotations: {
             readOnlyHint: true,
         },
     }, async (input) => {
         try {
-            const service = await createWorkspaceService(input);
+            const service = await getWorkspaceService();
             const result = await service.readSourceExcerpt({
                 targetFile: input.targetFile,
-                ...(input.range ? { range: input.range } : {}),
-                ...(input.symbolQuery ? { symbolQuery: input.symbolQuery } : {}),
+                range: input.range,
                 ...(input.maxLines !== undefined ? { maxLines: input.maxLines } : {}),
-            }, input.files);
+            });
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: `Prepared source excerpt from ${result.excerpt.fileName}:${result.excerpt.range.start.line}:${result.excerpt.range.start.character}.`,
+                    },
+                ],
+                structuredContent: toStructuredContent(result),
+            };
+        }
+        catch (error) {
+            return toToolErrorResult(error);
+        }
+    });
+    server.registerTool("arkts_read_symbol_excerpt", {
+        title: "Read ArkTS Symbol Excerpt",
+        description: "Return a precise source excerpt around a symbol inside the target file.",
+        inputSchema: readSymbolExcerptInputSchema,
+        outputSchema: readSourceExcerptOutputSchema,
+        annotations: {
+            readOnlyHint: true,
+        },
+    }, async (input) => {
+        try {
+            const service = await getWorkspaceService();
+            const result = await service.readSymbolExcerpt({
+                targetFile: input.targetFile,
+                symbolQuery: input.symbolQuery,
+                ...(input.maxLines !== undefined ? { maxLines: input.maxLines } : {}),
+            });
             return {
                 content: [
                     {
@@ -569,30 +591,18 @@ export function createArkTSMcpServer() {
     server.registerTool("arkts_get_evidence_context", {
         title: "Get ArkTS Evidence Context",
         description: "Return a bounded set of source-backed evidence snippets for high-confidence code understanding.",
-        inputSchema: {
-            ...workspaceScopedInputSchema,
-            targetFile: z.string().min(1).optional(),
-            symbolQuery: z.string().min(1).optional(),
-            question: z.string().min(1).optional(),
-            includeRelated: z.boolean().optional(),
-            snippetCount: z.number().int().positive().max(6).optional(),
-            budgetChars: z.number().int().positive().max(40000).optional(),
-        },
+        inputSchema: evidenceContextInputSchema,
         outputSchema: evidenceContextOutputSchema,
         annotations: {
             readOnlyHint: true,
         },
     }, async (input) => {
         try {
-            const service = await createWorkspaceService(input);
+            const service = await getWorkspaceService();
             const result = await service.getEvidenceContext({
-                ...(input.targetFile ? { targetFile: input.targetFile } : {}),
-                ...(input.symbolQuery ? { symbolQuery: input.symbolQuery } : {}),
+                targetFile: input.targetFile,
                 ...(input.question ? { question: input.question } : {}),
-                ...(input.includeRelated !== undefined ? { includeRelated: input.includeRelated } : {}),
-                ...(input.snippetCount !== undefined ? { snippetCount: input.snippetCount } : {}),
-                ...(input.budgetChars !== undefined ? { budgetChars: input.budgetChars } : {}),
-            }, input.files);
+            });
             return {
                 content: [
                     {
@@ -611,26 +621,18 @@ export function createArkTSMcpServer() {
     });
     server.registerTool("arkts_trace_dependencies", {
         title: "Trace Dependencies",
-        description: "Walk the local dependency graph from a target file or symbol and return a bounded graph slice.",
-        inputSchema: {
-            ...workspaceServiceInputSchema,
-            targetFile: z.string().min(1).optional(),
-            symbolQuery: z.string().min(1).optional(),
-            depth: z.number().int().positive().max(5).optional(),
-            limit: z.number().int().positive().max(100).optional(),
-        },
+        description: "Walk the local dependency graph from a target file and return a bounded graph slice.",
+        inputSchema: traceDependenciesInputSchema,
         outputSchema: dependencyTraceOutputSchema,
         annotations: {
             readOnlyHint: true,
         },
     }, async (input) => {
         try {
-            const service = await createWorkspaceService(input);
+            const service = await getWorkspaceService();
             const result = await service.traceDependencies({
-                ...(input.targetFile ? { targetFile: input.targetFile } : {}),
-                ...(input.symbolQuery ? { symbolQuery: input.symbolQuery } : {}),
+                targetFile: input.targetFile,
                 ...(input.depth !== undefined ? { depth: input.depth } : {}),
-                ...(input.limit !== undefined ? { limit: input.limit } : {}),
             });
             return {
                 content: [
@@ -651,19 +653,15 @@ export function createArkTSMcpServer() {
     server.registerTool("arkts_hover", {
         title: "Get ArkTS Hover",
         description: "Return type/signature/documentation information for the symbol at a 1-based position.",
-        inputSchema: {
-            ...workspaceScopedInputSchema,
-            targetFile: z.string().min(1),
-            position: positionSchema,
-        },
+        inputSchema: workspacePositionInputSchema,
         outputSchema: hoverOutputSchema,
         annotations: {
             readOnlyHint: true,
         },
     }, async (input) => {
         try {
-            const service = await createWorkspaceService(input);
-            const hover = service.getHover(input.targetFile, toAnalyzerPosition(input.position), input.files);
+            const service = await getWorkspaceService();
+            const hover = service.getHover(input.targetFile, toAnalyzerPosition(input.position));
             return {
                 content: [
                     {
@@ -687,19 +685,15 @@ export function createArkTSMcpServer() {
     server.registerTool("arkts_find_references", {
         title: "Find ArkTS References",
         description: "Find workspace references for the symbol at a 1-based position.",
-        inputSchema: {
-            ...workspaceScopedInputSchema,
-            targetFile: z.string().min(1),
-            position: positionSchema,
-        },
+        inputSchema: workspacePositionInputSchema,
         outputSchema: referencesOutputSchema,
         annotations: {
             readOnlyHint: true,
         },
     }, async (input) => {
         try {
-            const service = await createWorkspaceService(input);
-            const references = service.findReferences(input.targetFile, toAnalyzerPosition(input.position), input.files);
+            const service = await getWorkspaceService();
+            const references = service.findReferences(input.targetFile, toAnalyzerPosition(input.position));
             return {
                 content: [
                     {
@@ -723,19 +717,15 @@ export function createArkTSMcpServer() {
     server.registerTool("arkts_find_implementation", {
         title: "Find ArkTS Implementations",
         description: "Find implementation locations for the symbol at a 1-based position.",
-        inputSchema: {
-            ...workspaceScopedInputSchema,
-            targetFile: z.string().min(1),
-            position: positionSchema,
-        },
+        inputSchema: workspacePositionInputSchema,
         outputSchema: locationListOutputSchema,
         annotations: {
             readOnlyHint: true,
         },
     }, async (input) => {
         try {
-            const service = await createWorkspaceService(input);
-            const locations = service.findImplementations(input.targetFile, toAnalyzerPosition(input.position), input.files);
+            const service = await getWorkspaceService();
+            const locations = service.findImplementations(input.targetFile, toAnalyzerPosition(input.position));
             return {
                 content: [
                     {
@@ -759,19 +749,15 @@ export function createArkTSMcpServer() {
     server.registerTool("arkts_find_type_definition", {
         title: "Find ArkTS Type Definitions",
         description: "Find type definition locations for the symbol at a 1-based position.",
-        inputSchema: {
-            ...workspaceScopedInputSchema,
-            targetFile: z.string().min(1),
-            position: positionSchema,
-        },
+        inputSchema: workspacePositionInputSchema,
         outputSchema: locationListOutputSchema,
         annotations: {
             readOnlyHint: true,
         },
     }, async (input) => {
         try {
-            const service = await createWorkspaceService(input);
-            const locations = service.findTypeDefinitions(input.targetFile, toAnalyzerPosition(input.position), input.files);
+            const service = await getWorkspaceService();
+            const locations = service.findTypeDefinitions(input.targetFile, toAnalyzerPosition(input.position));
             return {
                 content: [
                     {
@@ -795,18 +781,15 @@ export function createArkTSMcpServer() {
     server.registerTool("arkts_document_symbols", {
         title: "Get ArkTS Document Symbols",
         description: "Return a hierarchical symbol tree for a target file.",
-        inputSchema: {
-            ...workspaceScopedInputSchema,
-            targetFile: z.string().min(1),
-        },
+        inputSchema: workspaceTargetFileInputSchema,
         outputSchema: documentSymbolsOutputSchema,
         annotations: {
             readOnlyHint: true,
         },
     }, async (input) => {
         try {
-            const service = await createWorkspaceService(input);
-            const symbols = service.getDocumentSymbols(input.targetFile, input.files);
+            const service = await getWorkspaceService();
+            const symbols = service.getDocumentSymbols(input.targetFile);
             return {
                 content: [
                     {
@@ -828,19 +811,16 @@ export function createArkTSMcpServer() {
     });
     server.registerTool("arkts_refresh_workspace", {
         title: "Refresh Workspace Snapshot",
-        description: "Invalidate and rebuild the persisted workspace snapshot, optionally tagging changed files in the response.",
-        inputSchema: {
-            ...workspaceServiceInputSchema,
-            changedFiles: z.array(z.string().min(1)).optional(),
-        },
+        description: "Invalidate and rebuild the persisted workspace snapshot for the active workspace.",
+        inputSchema: emptyInputSchema,
         outputSchema: refreshWorkspaceOutputSchema,
         annotations: {
             readOnlyHint: true,
         },
-    }, async (input) => {
+    }, async () => {
         try {
-            const service = await createWorkspaceService(input);
-            const result = await service.refresh(input.changedFiles);
+            const service = await getWorkspaceService();
+            const result = await service.refresh();
             return {
                 content: [
                     {
@@ -858,7 +838,7 @@ export function createArkTSMcpServer() {
     server.registerTool("arkts_analyze_components", {
         title: "Analyze ArkTS Components",
         description: "Analyze the decorated ArkTS component structure for a target file.",
-        inputSchema: workspaceInputSchema,
+        inputSchema: analyzerInputSchema,
         outputSchema: componentOutputSchema,
         annotations: {
             readOnlyHint: true,
@@ -892,7 +872,7 @@ export function createArkTSMcpServer() {
     server.registerTool("arkts_get_diagnostics", {
         title: "Get ArkTS Diagnostics",
         description: "Collect lexical, syntactic, and semantic diagnostics for a target file.",
-        inputSchema: workspaceInputSchema,
+        inputSchema: analyzerInputSchema,
         outputSchema: diagnosticsOutputSchema,
         annotations: {
             readOnlyHint: true,
@@ -926,10 +906,9 @@ export function createArkTSMcpServer() {
     server.registerTool("arkts_find_definition", {
         title: "Find ArkTS Definition",
         description: "Find the symbol definition at a 1-based line and character in the target file.",
-        inputSchema: {
-            ...workspaceInputSchema,
+        inputSchema: analyzerInputSchema.extend({
             position: positionSchema,
-        },
+        }),
         outputSchema: definitionOutputSchema,
         annotations: {
             readOnlyHint: true,
@@ -977,7 +956,6 @@ function createRequestContext(input) {
     }
     const rootNames = dedupePaths([
         targetFile,
-        ...(input.rootNames ?? []).map(normalizeInputPath),
         ...overlayEntries.map(([fileName]) => fileName),
     ]);
     const analyzer = new ArkTSAnalyzer({
@@ -993,15 +971,6 @@ function createRequestContext(input) {
         analyzer,
         targetFile,
     };
-}
-async function createWorkspaceService(input) {
-    return WorkspaceService.initialize(normalizeInputPath(input.workspaceRoot ?? process.cwd()), {
-        include: input.include,
-        exclude: input.exclude,
-        maxFiles: input.maxFiles,
-        cacheDir: input.cacheDir,
-        freshness: input.freshness,
-    });
 }
 function collectOverlayEntries(files) {
     const overlays = new Map();

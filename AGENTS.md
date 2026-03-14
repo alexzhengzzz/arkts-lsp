@@ -10,14 +10,15 @@ Use this order when it fits the task:
 2. `arkts_find_symbol`
 3. `arkts_summarize_file`
 4. `arkts_get_related_files`
-5. `arkts_read_source_excerpt` when exact implementation details matter
+5. `arkts_read_symbol_excerpt` when you need a symbol-centered excerpt
 6. `arkts_get_evidence_context` when a conclusion needs source-backed proof
-7. `arkts_explain_module`
-8. `arkts_trace_dependencies`
-9. `arkts_analyze_components`
-10. `arkts_get_diagnostics`
-11. `arkts_find_definition`
-12. `arkts_refresh_workspace` when files changed or cache looks stale
+7. `arkts_read_source_excerpt` when exact range-based implementation details matter
+8. `arkts_explain_module`
+9. `arkts_trace_dependencies`
+10. `arkts_analyze_components`
+11. `arkts_get_diagnostics`
+12. `arkts_find_definition`
+13. `arkts_refresh_workspace` when files changed or cache looks stale
 
 ## Repo Map
 
@@ -33,14 +34,14 @@ Use this order when it fits the task:
 ## Required Behavior
 
 - Prefer MCP tools for repository-level analysis instead of scanning many files with shell commands.
-- Always pass `workspaceRoot` for workspace-scoped ArkTS MCP tools when the repository root is known.
+- ArkTS MCP workspace tools are bound to the server startup `cwd` and repo config; do not pass `workspaceRoot` to tool calls.
 - Use direct file reads only when:
   - MCP results are insufficient
   - line-level confirmation is needed
   - implementation work requires editing specific files
 - When using `arkts_find_definition`, remember the position is 1-based `line` and `character`.
 - When the user asks for a summary of a repo problem, first build repo context with MCP, then drill into a small number of files.
-- Treat `workspace_overview`, `summarize_file`, `get_related_files`, and `trace_dependencies` as valid analysis tools, but prefer `arkts_read_source_excerpt` or `arkts_get_evidence_context` before making precise implementation claims.
+- Treat `workspace_overview`, `summarize_file`, `get_related_files`, and `trace_dependencies` as valid analysis tools, but prefer `arkts_read_symbol_excerpt`, `arkts_read_source_excerpt`, or `arkts_get_evidence_context` before making precise implementation claims.
 
 ## Path Compatibility Rules
 

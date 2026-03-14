@@ -1,3 +1,4 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-export declare function createArkTSMcpServer(): McpServer;
+import { type ResolvedMcpServerConfig } from "./mcp-config.js";
+export declare function createArkTSMcpServer(serverConfig?: ResolvedMcpServerConfig): McpServer;
 export declare function main(): Promise<void>;

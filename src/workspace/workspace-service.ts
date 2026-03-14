@@ -112,12 +112,8 @@ interface ExcerptBuildOptions {
 }
 
 interface EvidenceContextOptions {
-  targetFile?: string | undefined;
-  symbolQuery?: string | undefined;
+  targetFile: string;
   question?: string | undefined;
-  includeRelated?: boolean | undefined;
-  snippetCount?: number | undefined;
-  budgetChars?: number | undefined;
 }
 
 interface EvidenceCandidate {
@@ -389,7 +385,7 @@ export class WorkspaceService {
     overlays: WorkspaceOverlayFile[] = [],
   ): Promise<ContextBundle> {
     const limit = clamp(options.limit ?? 6, 1, 20);
-    const targetFile = this.resolveTargetFile(options.targetFile, options.symbolQuery);
+    const targetFile = this.resolveWorkspacePath(options.targetFile);
     const overlayMap = toOverlayMap(this.workspaceRoot, overlays);
     const summary = await this.getFileSummaryForPath(targetFile, overlayMap);
     if (!summary) {
@@ -403,10 +399,7 @@ export class WorkspaceService {
       targetFile,
       await this.createContextFile(summary, "self", "Primary target file.", {
         overlayMap,
-        ...(options.symbolQuery ? { symbolQuery: options.symbolQuery } : {}),
-        whySelected: options.symbolQuery
-          ? `Matched symbol query "${options.symbolQuery}" in the target file.`
-          : "Selected as the primary file for contextual reading.",
+        whySelected: "Selected as the primary file for contextual reading.",
       }),
     );
 
@@ -498,10 +491,7 @@ export class WorkspaceService {
 
     return {
       rootFile: summary.fileName,
-      reason:
-        options.symbolQuery !== undefined
-          ? `Context bundle for symbol query "${options.symbolQuery}".`
-          : `Context bundle for ${summary.relativePath}.`,
+      reason: `Context bundle for ${summary.relativePath}.`,
       files: [...rankedFiles.values()].slice(0, limit),
       provenance: overlayMap.size > 0 ? "live" : "snapshot",
     };
@@ -576,8 +566,7 @@ export class WorkspaceService {
   public async readSourceExcerpt(
     input: {
       targetFile: string;
-      range?: ExternalRange;
-      symbolQuery?: string;
+      range: ExternalRange;
       maxLines?: number;
     },
     overlays: WorkspaceOverlayFile[] = [],
@@ -591,23 +580,52 @@ export class WorkspaceService {
       throw new Error(`Target file is not indexed in workspace: ${normalizedFileName}`);
     }
 
-    const focusRange = input.range ?? this.findPreferredRange(summary, input.symbolQuery);
+    const excerpt = await this.buildSourceExcerpt(summary, overlayMap, {
+      maxLines,
+      focusRange: input.range,
+      strictRange: true,
+      contextBefore: 0,
+      contextAfter: 0,
+    }, {
+      whySelected: "Returned the explicitly requested source range.",
+    });
+
+    return {
+      targetFile: normalizedFileName,
+      excerpt,
+    };
+  }
+
+  public async readSymbolExcerpt(
+    input: {
+      targetFile: string;
+      symbolQuery: string;
+      maxLines?: number;
+    },
+    overlays: WorkspaceOverlayFile[] = [],
+  ): Promise<ReadSourceExcerptResult> {
+    const normalizedFileName = this.resolveWorkspacePath(input.targetFile);
+    const maxLines = clamp(input.maxLines ?? 60, 1, 200);
+    const overlayMap = toOverlayMap(this.workspaceRoot, overlays);
+    const summary = await this.getFileSummaryForPath(normalizedFileName, overlayMap);
+
+    if (!summary) {
+      throw new Error(`Target file is not indexed in workspace: ${normalizedFileName}`);
+    }
+
+    const focusRange = this.findPreferredRange(summary, input.symbolQuery);
     if (!focusRange) {
-      throw new Error("Either range or symbolQuery is required.");
+      throw new Error(`No symbol matched query in target file: ${input.symbolQuery}`);
     }
 
     const excerpt = await this.buildSourceExcerpt(summary, overlayMap, {
       maxLines,
       focusRange,
-      strictRange: input.range !== undefined,
-      contextBefore: input.range ? 0 : 3,
-      contextAfter: input.range ? 0 : 3,
+      contextBefore: 3,
+      contextAfter: 3,
     }, {
-      ...(input.symbolQuery ? { symbolName: input.symbolQuery } : {}),
-      whySelected:
-        input.range !== undefined
-          ? "Returned the explicitly requested source range."
-          : `Returned the source excerpt surrounding "${input.symbolQuery ?? "selection"}".`,
+      symbolName: input.symbolQuery,
+      whySelected: `Returned the source excerpt surrounding "${input.symbolQuery}".`,
     });
 
     return {
@@ -620,7 +638,7 @@ export class WorkspaceService {
     options: EvidenceContextOptions,
     overlays: WorkspaceOverlayFile[] = [],
   ): Promise<EvidenceContextResult> {
-    const targetFile = this.resolveTargetFile(options.targetFile, options.symbolQuery);
+    const targetFile = this.resolveWorkspacePath(options.targetFile);
     const overlayMap = toOverlayMap(this.workspaceRoot, overlays);
     const rootSummary = await this.getFileSummaryForPath(targetFile, overlayMap);
 
@@ -628,14 +646,13 @@ export class WorkspaceService {
       throw new Error(`Target file is not indexed in workspace: ${targetFile}`);
     }
 
-    const snippetCount = clamp(options.snippetCount ?? 4, 1, 6);
-    const budgetChars = clamp(options.budgetChars ?? 6000, 400, 40_000);
-    const includeRelated = options.includeRelated ?? true;
+    const snippetCount = 4;
+    const budgetChars = 6000;
+    const includeRelated = true;
     const candidates = await this.collectEvidenceCandidates({
       rootSummary,
       includeRelated,
       overlayMap,
-      ...(options.symbolQuery ? { symbolQuery: options.symbolQuery } : {}),
       ...(options.question ? { question: options.question } : {}),
     });
     const snippets: EvidenceSnippet[] = [];
@@ -720,9 +737,9 @@ export class WorkspaceService {
   public async traceDependencies(
     options: TraceDependenciesOptions,
   ): Promise<DependencyTrace> {
-    const targetFile = this.resolveTargetFile(options.targetFile, options.symbolQuery);
+    const targetFile = this.resolveWorkspacePath(options.targetFile);
     const depth = clamp(options.depth ?? 2, 1, 5);
-    const limit = clamp(options.limit ?? 25, 1, 100);
+    const limit = 25;
     const queue: Array<{ fileName: string; depth: number }> = [{ fileName: targetFile, depth: 0 }];
     const visited = new Set<string>();
     const nodes: DependencyTraceNode[] = [];
@@ -1172,26 +1189,6 @@ export class WorkspaceService {
     };
   }
 
-  private resolveTargetFile(
-    targetFile: string | undefined,
-    symbolQuery: string | undefined,
-  ): string {
-    if (targetFile) {
-      return this.resolveWorkspacePath(targetFile);
-    }
-
-    if (symbolQuery) {
-      const match = this.findSymbol(symbolQuery, { limit: 1 }).matches[0];
-      if (!match) {
-        throw new Error(`No symbol matched query: ${symbolQuery}`);
-      }
-
-      return match.fileName;
-    }
-
-    throw new Error("Either targetFile or symbolQuery is required.");
-  }
-
   private resolveWorkspacePath(fileName: string): string {
     return path.normalize(
       path.isAbsolute(fileName)
@@ -1482,7 +1479,9 @@ function normalizePatternList(
   defaults: string[],
 ): string[] {
   const sourcePatterns = patterns && patterns.length > 0 ? patterns : defaults;
-  return sourcePatterns.map((pattern) => toPosixPath(pattern.trim())).filter(Boolean);
+  return [...new Set(
+    sourcePatterns.map((pattern) => toPosixPath(pattern.trim())).filter(Boolean),
+  )].sort();
 }
 
 async function discoverWorkspaceFiles(

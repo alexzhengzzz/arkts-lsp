@@ -1,6 +1,6 @@
 # ArkTS Analyzer MCP Server
 
-一个基于 TypeScript 的 ArkTS 分析与工作区索引服务，提供 17 个只读 MCP 工具，既支持单文件语义分析，也支持面向仓库的符号检索、依赖追踪、上下文摘要和源码证据提取。
+一个基于 TypeScript 的 ArkTS 分析与工作区索引服务，提供 18 个只读 MCP 工具，既支持单文件语义分析，也支持面向仓库的符号检索、依赖追踪、上下文摘要和源码证据提取。
 
 ## 能力概览
 
@@ -9,7 +9,9 @@
 - 提供定义、类型定义、实现、引用、hover、文档符号等语言能力。
 - 构建可持久化的工作区快照，用于文件摘要、符号搜索、相关文件聚合和依赖图追踪。
 - 区分 summary 型结果与 source 型证据结果，支持带行号范围的源码片段提取。
-- 支持 in-memory overlays，适合编辑器或 agent 在未落盘内容上做分析。
+- 支持 in-memory overlays，适合编辑器或 agent 在未落盘内容上做单文件分析。
+- MCP 工作区工具绑定到服务启动时的仓库配置，不再在每次工具调用里传递 `workspaceRoot`、缓存或刷新策略。
+- MCP 工作区工具使用内置的文件发现规则；如需自定义 `include` / `exclude`，请直接调用 `WorkspaceService`。
 
 ## 工具分组
 
@@ -32,6 +34,7 @@
 ### 源码证据
 
 - `arkts_read_source_excerpt`
+- `arkts_read_symbol_excerpt`
 - `arkts_get_evidence_context`
 
 ### 语言服务查询
@@ -45,7 +48,8 @@
 ## 仓库结构
 
 - `src/index.ts`: 包导出入口。
-- `src/mcp-server.ts`: MCP stdio server 与 17 个工具注册。
+- `src/mcp-server.ts`: MCP stdio server 与 18 个工具注册。
+- `src/mcp-config.ts`: 仓库级 MCP 配置加载与启动参数覆盖。
 - `src/build-workspace-index.ts`: 本地一次性触发工作区索引构建的 CLI。
 - `src/core/arkts-analyzer.ts`: 单文件 ArkTS 分析核心。
 - `src/core/compiler-host.ts`: TypeScript compiler host / language service host 适配。
@@ -80,7 +84,38 @@ npm run verify:workspace-cache
 ```
 
 `start:mcp` 会通过 stdio 启动 `dist/mcp-server.js`，因此首次运行前需要先执行 `npm run build`。
+MCP 服务会在启动 `cwd` 下查找 `arkts-mcp.config.json`，并把该目录视为仓库根目录入口。
 `workspace:index` 会为目标目录执行一次工作区初始化并立刻 `refresh()`，用来快速触发全仓索引构建或增量刷新；默认目标目录是当前工作目录，也支持 `--json`、`--verbose`、`--cache-dir`、`--max-files`、`--freshness`。其中 `--verbose` 会把阶段日志、已发现文件数和索引进度输出到 `stderr`。
+
+## MCP 仓库配置
+
+MCP 服务只在启动 `cwd` 下读取 `arkts-mcp.config.json`，不向上查找祖先目录。推荐把 MCP 客户端的 `cwd` 设为仓库根目录。
+
+配置文件使用扁平 JSON：
+
+```json
+{
+  "workspaceRoot": ".",
+  "maxFiles": 2000,
+  "cacheDir": ".cache/arkts-analyzer",
+  "freshness": "mtime"
+}
+```
+
+字段说明：
+
+- `workspaceRoot`: 缺省时为配置文件所在目录；相对路径相对配置文件目录解析。
+- `maxFiles`: 缺省时使用服务内置默认值；`null` 表示不设上限。
+- `cacheDir`: 缺省时使用服务内置缓存目录；相对路径相对最终 `workspaceRoot` 解析。
+- `freshness`: 可选 `"mtime"` 或 `"always"`，默认 `"mtime"`。
+
+优先级：
+
+1. MCP 启动参数 `--workspace-root` / `--max-files` / `--cache-dir` / `--freshness`
+2. `arkts-mcp.config.json`
+3. 服务内置默认值
+
+如果配置文件存在但 JSON 非法、字段类型错误或包含未知字段，服务会启动失败。
 
 ### 建索引命令示例
 
@@ -123,7 +158,28 @@ npm run verify:workspace-cache
   "mcpServers": {
     "arkts-analyzer": {
       "command": "node",
-      "args": ["/absolute/path/to/lsp_arkts/dist/mcp-server.js"]
+      "args": ["/absolute/path/to/lsp_arkts/dist/mcp-server.js"],
+      "cwd": "/absolute/path/to/workspace"
+    }
+  }
+}
+```
+
+如需临时覆盖仓库配置，也可以在 `args` 中追加：
+
+```json
+{
+  "mcpServers": {
+    "arkts-analyzer": {
+      "command": "node",
+      "args": [
+        "/absolute/path/to/lsp_arkts/dist/mcp-server.js",
+        "--max-files",
+        "null",
+        "--cache-dir",
+        ".cache/arkts-analyzer"
+      ],
+      "cwd": "/absolute/path/to/workspace"
     }
   }
 }

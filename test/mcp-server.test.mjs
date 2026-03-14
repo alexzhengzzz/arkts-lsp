@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -10,6 +10,29 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 
 const serverPath = path.resolve(process.cwd(), "dist/mcp-server.js");
 const workspaceIndexScriptPath = path.resolve(process.cwd(), "dist/build-workspace-index.js");
+
+test.after(() => {
+  for (const handle of process._getActiveHandles()) {
+    if (handle === process.stdin || handle === process.stdout || handle === process.stderr) {
+      continue;
+    }
+
+    if (typeof handle.unref === "function") {
+      handle.unref();
+    }
+    if (typeof handle.destroy === "function") {
+      handle.destroy();
+      continue;
+    }
+    if (typeof handle.close === "function") {
+      handle.close();
+    }
+  }
+
+  setImmediate(() => {
+    process.exit(process.exitCode ?? 0);
+  });
+});
 
 test("MCP server lists the required ArkTS tools", async () => {
   await withClient({}, async (client) => {
@@ -30,6 +53,7 @@ test("MCP server lists the required ArkTS tools", async () => {
       "arkts_get_related_files",
       "arkts_hover",
       "arkts_read_source_excerpt",
+      "arkts_read_symbol_excerpt",
       "arkts_refresh_workspace",
       "arkts_summarize_file",
       "arkts_trace_dependencies",
@@ -560,11 +584,10 @@ test("language-service MCP tools return hover, references, implementations, type
   const workspace = await createLanguageServiceWorkspaceFixture("arkts-mcp-language-service-");
 
   try {
-    await withClient({}, async (client) => {
+    await withClient({ cwd: workspace.root }, async (client) => {
       const hoverResult = await client.callTool({
         name: "arkts_hover",
         arguments: {
-          workspaceRoot: workspace.root,
           targetFile: "src/App.ets",
           position: positionOf(workspace.appSource, "useGreeter", "last"),
         },
@@ -578,7 +601,6 @@ test("language-service MCP tools return hover, references, implementations, type
       const referencesResult = await client.callTool({
         name: "arkts_find_references",
         arguments: {
-          workspaceRoot: workspace.root,
           targetFile: "src/App.ets",
           position: positionOf(workspace.appSource, "useGreeter", "last"),
         },
@@ -594,7 +616,6 @@ test("language-service MCP tools return hover, references, implementations, type
       const implementationResult = await client.callTool({
         name: "arkts_find_implementation",
         arguments: {
-          workspaceRoot: workspace.root,
           targetFile: "src/App.ets",
           position: positionOf(workspace.appSource, "Greeter =", "first"),
         },
@@ -607,7 +628,6 @@ test("language-service MCP tools return hover, references, implementations, type
       const typeDefinitionResult = await client.callTool({
         name: "arkts_find_type_definition",
         arguments: {
-          workspaceRoot: workspace.root,
           targetFile: "src/App.ets",
           position: positionOf(workspace.appSource, "greeter", "last"),
         },
@@ -620,7 +640,6 @@ test("language-service MCP tools return hover, references, implementations, type
       const documentSymbolsResult = await client.callTool({
         name: "arkts_document_symbols",
         arguments: {
-          workspaceRoot: workspace.root,
           targetFile: "src/App.ets",
         },
       });
@@ -640,42 +659,16 @@ test("language-service MCP tools return hover, references, implementations, type
 
 test("workspace MCP tools build repo maps, honor overlays, and refresh snapshots", async () => {
   const workspace = await createWorkspaceFixture("arkts-mcp-workspace-");
-  const cacheDir = path.join(workspace.root, ".cache-test");
-  const limitedCacheDir = path.join(workspace.root, ".cache-limited");
-  const unlimitedCacheDir = path.join(workspace.root, ".cache-unlimited");
 
   try {
-    await withClient({}, async (client) => {
-      const limitedOverviewResult = await client.callTool({
-        name: "arkts_workspace_overview",
-        arguments: {
-          workspaceRoot: workspace.root,
-          cacheDir: limitedCacheDir,
-          maxFiles: 1,
-        },
-      });
-      const limitedOverview = getStructuredContent(limitedOverviewResult);
-      assert.equal(limitedOverview.fileCount, 1);
-      assert.equal(limitedOverview.truncated, true);
+    await writeMcpConfig(workspace.root, {
+      cacheDir: ".cache-test",
+    });
 
-      const unlimitedOverviewResult = await client.callTool({
-        name: "arkts_workspace_overview",
-        arguments: {
-          workspaceRoot: workspace.root,
-          cacheDir: unlimitedCacheDir,
-          maxFiles: null,
-        },
-      });
-      const unlimitedOverview = getStructuredContent(unlimitedOverviewResult);
-      assert.equal(unlimitedOverview.fileCount, 4);
-      assert.equal(unlimitedOverview.truncated, false);
-
+    await withClient({ cwd: workspace.root }, async (client) => {
       const overviewResult = await client.callTool({
         name: "arkts_workspace_overview",
-        arguments: {
-          workspaceRoot: workspace.root,
-          cacheDir,
-        },
+        arguments: {},
       });
       const overview = getStructuredContent(overviewResult);
       assert.equal(overview.fileCount, 4);
@@ -684,62 +677,16 @@ test("workspace MCP tools build repo maps, honor overlays, and refresh snapshots
       const summaryResult = await client.callTool({
         name: "arkts_summarize_file",
         arguments: {
-          workspaceRoot: workspace.root,
-          cacheDir,
           targetFile: "src/App.ets",
-          files: [
-            {
-              fileName: "src/App.ets",
-              content: `import { Card } from "./Card.ets";
-import { greet } from "./utils/helper.ts";
-
-@Preview
-@Entry
-@Component
-struct App {
-  @State count: number = 0;
-  @Prop subtitle: string = "overlay";
-  @State title: string = "overlay";
-
-  @Watch("count")
-  onCountChange(): void {}
-
-  build() {
-    greet();
-    const card = new Card();
-    return card;
-  }
-}
-`,
-            },
-          ],
         },
       });
       const summary = getStructuredContent(summaryResult);
-      assert.deepEqual(
-        summary.components[0].stateMembers.map((member) => member.name),
-        ["count", "title"],
-      );
-      assert.deepEqual(
-        summary.components[0].decoratedMembers.map((member) => ({
-          name: member.name,
-          decorator: member.decorator,
-          kind: member.kind,
-        })),
-        [
-          { name: "count", decorator: "State", kind: "state" },
-          { name: "subtitle", decorator: "Prop", kind: "prop" },
-          { name: "title", decorator: "State", kind: "state" },
-          { name: "onCountChange", decorator: "Watch", kind: "other" },
-        ],
-      );
       assert.match(summary.summary, /recognized decorated member\(s\)/);
+      assert.equal(summary.provenance, "snapshot");
 
       const symbolResult = await client.callTool({
         name: "arkts_find_symbol",
         arguments: {
-          workspaceRoot: workspace.root,
-          cacheDir,
           query: "greet",
         },
       });
@@ -749,8 +696,6 @@ struct App {
       const relatedResult = await client.callTool({
         name: "arkts_get_related_files",
         arguments: {
-          workspaceRoot: workspace.root,
-          cacheDir,
           targetFile: "src/App.ets",
           limit: 4,
         },
@@ -771,13 +716,28 @@ struct App {
         ),
       );
 
+      const readSymbolResult = await client.callTool({
+        name: "arkts_read_symbol_excerpt",
+        arguments: {
+          targetFile: "src/utils/helper.ts",
+          symbolQuery: "greet",
+          maxLines: 20,
+        },
+      });
+      const readSymbolExcerpt = getStructuredContent(readSymbolResult);
+      assert.equal(readSymbolExcerpt.targetFile, workspace.helperFile);
+      assert.equal(readSymbolExcerpt.excerpt.provenance, "snapshot");
+      assert.equal(readSymbolExcerpt.excerpt.evidenceLevel, "source");
+      assert.match(readSymbolExcerpt.excerpt.content, /export function greet/);
+
       const excerptResult = await client.callTool({
         name: "arkts_read_source_excerpt",
         arguments: {
-          workspaceRoot: workspace.root,
-          cacheDir,
           targetFile: "src/utils/helper.ts",
-          symbolQuery: "greet",
+          range: {
+            start: { line: 3, character: 1 },
+            end: { line: 5, character: 2 },
+          },
           maxLines: 20,
         },
       });
@@ -790,13 +750,8 @@ struct App {
       const evidenceResult = await client.callTool({
         name: "arkts_get_evidence_context",
         arguments: {
-          workspaceRoot: workspace.root,
-          cacheDir,
           targetFile: "src/App.ets",
           question: "哪里构造 Card 并调用 helper",
-          includeRelated: true,
-          snippetCount: 3,
-          budgetChars: 4000,
         },
       });
       const evidence = getStructuredContent(evidenceResult);
@@ -814,45 +769,9 @@ struct App {
         snippet.range
       ));
 
-      const liveEvidenceResult = await client.callTool({
-        name: "arkts_get_evidence_context",
-        arguments: {
-          workspaceRoot: workspace.root,
-          cacheDir,
-          targetFile: "src/App.ets",
-          symbolQuery: "App",
-          snippetCount: 2,
-          budgetChars: 1200,
-          files: [
-            {
-              fileName: "src/App.ets",
-              content: `import { Card } from "./Card.ets";
-import { greet } from "./utils/helper.ts";
-
-@Entry
-@Component
-struct App {
-  build() {
-    greet();
-    return "overlay";
-  }
-}
-`,
-            },
-          ],
-        },
-      });
-      const liveEvidence = getStructuredContent(liveEvidenceResult);
-      assert.equal(liveEvidence.provenance, "live");
-      assert.ok(liveEvidence.snippets.some((snippet) =>
-        snippet.provenance === "live" && snippet.content.includes('return "overlay"')
-      ));
-
       const traceResult = await client.callTool({
         name: "arkts_trace_dependencies",
         arguments: {
-          workspaceRoot: workspace.root,
-          cacheDir,
           targetFile: "src/App.ets",
           depth: 2,
         },
@@ -873,29 +792,275 @@ struct App {
 
       const refreshResult = await client.callTool({
         name: "arkts_refresh_workspace",
-        arguments: {
-          workspaceRoot: workspace.root,
-          cacheDir,
-          changedFiles: ["src/utils/helper.ts"],
-        },
+        arguments: {},
       });
       const refresh = getStructuredContent(refreshResult);
       assert.equal(refresh.fileCount, 4);
-      assert.equal(refresh.refreshMode, "incremental");
-      assert.equal(refresh.changedFileCount, 1);
-      assert.equal(refresh.reindexedFileCount, 3);
-      assert.equal(refresh.reusedFileCount, 1);
+      assert.equal(typeof refresh.refreshMode, "string");
 
       const refreshedSymbolResult = await client.callTool({
         name: "arkts_find_symbol",
         arguments: {
-          workspaceRoot: workspace.root,
-          cacheDir,
           query: "renamedHelper",
         },
       });
       const refreshedSymbols = getStructuredContent(refreshedSymbolResult);
       assert.equal(refreshedSymbols.matches[0]?.fileName, workspace.helperFile);
+    });
+
+    await withClient({
+      cwd: workspace.root,
+      serverArgs: ["--cache-dir", ".cache-limited", "--max-files", "1"],
+    }, async (client) => {
+      const limitedOverviewResult = await client.callTool({
+        name: "arkts_workspace_overview",
+        arguments: {},
+      });
+      const limitedOverview = getStructuredContent(limitedOverviewResult);
+      assert.equal(limitedOverview.fileCount, 1);
+      assert.equal(limitedOverview.truncated, true);
+    });
+
+    await withClient({
+      cwd: workspace.root,
+      serverArgs: ["--cache-dir", ".cache-unlimited", "--max-files", "null"],
+    }, async (client) => {
+      const unlimitedOverviewResult = await client.callTool({
+        name: "arkts_workspace_overview",
+        arguments: {},
+      });
+      const unlimitedOverview = getStructuredContent(unlimitedOverviewResult);
+      assert.equal(unlimitedOverview.fileCount, 4);
+      assert.equal(unlimitedOverview.truncated, false);
+    });
+  } finally {
+    await rm(workspace.root, { recursive: true, force: true });
+  }
+});
+
+test("workspace MCP tools reuse persisted snapshots across server restarts", async () => {
+  const workspace = await createWorkspaceFixture("arkts-mcp-pattern-cache-");
+
+  try {
+    await writeMcpConfig(workspace.root, {
+      cacheDir: ".cache-test",
+    });
+
+    await withClient({ cwd: workspace.root }, async (client) => {
+      const firstResult = await client.callTool({
+        name: "arkts_workspace_overview",
+        arguments: {},
+      });
+      const firstOverview = getStructuredContent(firstResult);
+      assert.equal(firstOverview.cacheStatus, "rebuilt");
+    });
+
+    await withClient({ cwd: workspace.root }, async (client) => {
+      const secondResult = await client.callTool({
+        name: "arkts_workspace_overview",
+        arguments: {},
+      });
+      const secondOverview = getStructuredContent(secondResult);
+      assert.equal(secondOverview.cacheStatus, "hit");
+      assert.equal(secondOverview.fileCount, 4);
+    });
+  } finally {
+    await rm(workspace.root, { recursive: true, force: true });
+  }
+});
+
+test("workspace MCP server reads arkts-mcp.config.json and resolves relative paths", async () => {
+  const workspace = await createWorkspaceFixture("arkts-mcp-config-relative-");
+  const launchRoot = path.dirname(workspace.root);
+  const workspaceName = path.basename(workspace.root);
+
+  try {
+    await writeMcpConfig(launchRoot, {
+      workspaceRoot: workspaceName,
+      maxFiles: 1,
+      cacheDir: ".cache-relative",
+      freshness: "always",
+    });
+
+    await withClient({ cwd: launchRoot }, async (client) => {
+      const firstResult = await client.callTool({
+        name: "arkts_workspace_overview",
+        arguments: {},
+      });
+      const firstOverview = getStructuredContent(firstResult);
+      assert.equal(firstOverview.workspaceRoot, workspace.root);
+      assert.equal(firstOverview.fileCount, 1);
+      assert.equal(firstOverview.cacheStatus, "rebuilt");
+    });
+
+    const cacheFile = path.join(workspace.root, ".cache-relative");
+    const cacheStat = await stat(cacheFile);
+    assert.ok(cacheStat.isDirectory());
+
+    await withClient({ cwd: launchRoot }, async (client) => {
+      const secondResult = await client.callTool({
+        name: "arkts_workspace_overview",
+        arguments: {},
+      });
+      const secondOverview = getStructuredContent(secondResult);
+      assert.equal(secondOverview.workspaceRoot, workspace.root);
+      assert.equal(secondOverview.fileCount, 1);
+      assert.equal(secondOverview.cacheStatus, "rebuilt");
+    });
+  } finally {
+    await rm(path.join(launchRoot, "arkts-mcp.config.json"), { force: true });
+    await rm(workspace.root, { recursive: true, force: true });
+  }
+});
+
+test("workspace MCP startup args override repo config", async () => {
+  const workspace = await createWorkspaceFixture("arkts-mcp-config-override-");
+
+  try {
+    await writeMcpConfig(workspace.root, {
+      maxFiles: 1,
+      cacheDir: ".cache-config",
+    });
+
+    await withClient({
+      cwd: workspace.root,
+      serverArgs: ["--max-files", "null", "--cache-dir", ".cache-override"],
+    }, async (client) => {
+      const result = await client.callTool({
+        name: "arkts_workspace_overview",
+        arguments: {},
+      });
+      const overview = getStructuredContent(result);
+      assert.equal(overview.fileCount, 4);
+      assert.equal(overview.truncated, false);
+    });
+  } finally {
+    await rm(workspace.root, { recursive: true, force: true });
+  }
+});
+
+test("workspace MCP server fails fast for invalid config files", async () => {
+  const cases = [
+    {
+      name: "invalid json",
+      content: "{",
+      pattern: /Invalid arkts-mcp\.config\.json:/,
+    },
+    {
+      name: "invalid maxFiles",
+      content: JSON.stringify({ maxFiles: "many" }),
+      pattern: /Invalid arkts-mcp\.config\.json at maxFiles:/,
+    },
+    {
+      name: "zero maxFiles",
+      content: JSON.stringify({ maxFiles: 0 }),
+      pattern: /Invalid arkts-mcp\.config\.json at maxFiles:/,
+    },
+    {
+      name: "negative maxFiles",
+      content: JSON.stringify({ maxFiles: -1 }),
+      pattern: /Invalid arkts-mcp\.config\.json at maxFiles:/,
+    },
+    {
+      name: "fractional maxFiles",
+      content: JSON.stringify({ maxFiles: 1.5 }),
+      pattern: /Invalid arkts-mcp\.config\.json at maxFiles:/,
+    },
+    {
+      name: "invalid freshness",
+      content: JSON.stringify({ freshness: "stale" }),
+      pattern: /Invalid arkts-mcp\.config\.json at freshness:/,
+    },
+    {
+      name: "unknown field",
+      content: JSON.stringify({ unexpected: true }),
+      pattern: /Invalid arkts-mcp\.config\.json at unexpected:/,
+    },
+  ];
+
+  for (const testCase of cases) {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), `arkts-mcp-invalid-config-${testCase.name}-`));
+    try {
+      await writeFile(path.join(tempDir, "arkts-mcp.config.json"), testCase.content, "utf8");
+      await assert.rejects(
+        withClient({ cwd: tempDir }, async () => {}),
+        testCase.pattern,
+      );
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("workspace MCP tools reject removed and ambiguous parameters", async () => {
+  const workspace = await createWorkspaceFixture("arkts-mcp-schema-");
+
+  try {
+    await withClient({ cwd: workspace.root }, async (client) => {
+      await assertToolInputError(client, {
+          name: "arkts_workspace_overview",
+          arguments: {
+            workspaceRoot: workspace.root,
+          },
+        });
+
+      await assertToolInputError(client, {
+          name: "arkts_summarize_file",
+          arguments: {
+            targetFile: "src/App.ets",
+            files: [
+              {
+                fileName: "src/App.ets",
+                content: "override",
+              },
+            ],
+          },
+        });
+
+      await assertToolInputError(client, {
+          name: "arkts_get_related_files",
+          arguments: {
+            targetFile: "src/App.ets",
+            symbolQuery: "App",
+          },
+        });
+
+      await assertToolInputError(client, {
+          name: "arkts_trace_dependencies",
+          arguments: {
+            targetFile: "src/App.ets",
+            symbolQuery: "App",
+          },
+        });
+
+      await assertToolInputError(client, {
+          name: "arkts_get_evidence_context",
+          arguments: {
+            targetFile: "src/App.ets",
+            symbolQuery: "App",
+          },
+        });
+
+      await assertToolInputError(client, {
+          name: "arkts_refresh_workspace",
+          arguments: {
+            changedFiles: ["src/App.ets"],
+          },
+        });
+
+      await assertToolInputError(client, {
+          name: "arkts_read_source_excerpt",
+          arguments: {
+            targetFile: "src/App.ets",
+          },
+        });
+
+      await assertToolInputError(client, {
+          name: "arkts_read_symbol_excerpt",
+          arguments: {
+            targetFile: "src/App.ets",
+          },
+        });
     });
   } finally {
     await rm(workspace.root, { recursive: true, force: true });
@@ -935,7 +1100,7 @@ async function withClient(options, fn) {
   const stderr = [];
   const transport = new StdioClientTransport({
     command: process.execPath,
-    args: [serverPath],
+    args: [serverPath, ...(options.serverArgs ?? [])],
     cwd: options.cwd,
     stderr: "pipe",
   });
@@ -966,7 +1131,25 @@ async function withClient(options, fn) {
     throw error;
   } finally {
     await client.close().catch(() => {});
+    await transport.close().catch(() => {});
+    stderrStream?.removeAllListeners?.();
+    stderrStream?.destroy?.();
   }
+}
+
+async function writeMcpConfig(root, config) {
+  await writeFile(
+    path.join(root, "arkts-mcp.config.json"),
+    `${JSON.stringify(config, null, 2)}\n`,
+    "utf8",
+  );
+}
+
+async function assertToolInputError(client, request) {
+  const result = await client.callTool(request);
+  assert.ok(!("toolResult" in result), "Expected a standard tool result payload.");
+  assert.equal(result.isError, true);
+  assert.match(result.content[0]?.text ?? "", /Input validation error/);
 }
 
 function getStructuredContent(result) {

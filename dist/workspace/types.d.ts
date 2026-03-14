@@ -171,8 +171,7 @@ export interface ContextBundle {
     provenance: WorkspaceProvenance;
 }
 export interface RelatedFilesOptions {
-    targetFile?: string | undefined;
-    symbolQuery?: string | undefined;
+    targetFile: string;
     limit?: number | undefined;
 }
 export interface ExplainModuleResult {
@@ -181,10 +180,8 @@ export interface ExplainModuleResult {
     provenance: WorkspaceProvenance;
 }
 export interface TraceDependenciesOptions {
-    targetFile?: string | undefined;
-    symbolQuery?: string | undefined;
+    targetFile: string;
     depth?: number | undefined;
-    limit?: number | undefined;
 }
 export interface DependencyTraceNode {
     fileName: string;
