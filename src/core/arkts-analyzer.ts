@@ -5,20 +5,26 @@ import {
 } from "./compiler-host.js";
 import {
   ARKTS_COMPONENT_DECORATOR,
+  ARKTS_COMPONENT_V2_DECORATOR,
   ARKTS_CONSUME_DECORATOR,
+  ARKTS_BUILDER_DECORATOR,
+  ARKTS_COMPUTED_DECORATOR,
   ARKTS_ENTRY_DECORATOR,
   ARKTS_INTRINSICS_FILE_NAME,
   ARKTS_LINK_DECORATOR,
   ARKTS_LOCAL_DECORATOR,
   ARKTS_LOCAL_STORAGE_LINK_DECORATOR,
   ARKTS_LOCAL_STORAGE_PROP_DECORATOR,
+  ARKTS_PARAM_DECORATOR,
   ARKTS_OBJECT_LINK_DECORATOR,
   ARKTS_PROP_DECORATOR,
   ARKTS_PROVIDE_DECORATOR,
+  ARKTS_REQUIRE_DECORATOR,
   ARKTS_STATE_DECORATOR,
   ARKTS_STORAGE_LINK_DECORATOR,
   ARKTS_STORAGE_PROP_DECORATOR,
   ARKTS_BUILDER_PARAM_DECORATOR,
+  ARKTS_TRACE_DECORATOR,
   ARKTS_WATCH_DECORATOR,
   isArkTSIntrinsicFile,
   normalizeArkTSSource,
@@ -51,6 +57,8 @@ export interface AnalyzerDiagnostic {
   code: number;
   message: string;
   range: AnalyzerRange;
+  confidence: "high" | "low";
+  reason?: string | undefined;
 }
 
 export interface StateMemberInfo {
@@ -62,6 +70,12 @@ export interface StateMemberInfo {
 export type DecoratedMemberKind =
   | "state"
   | "prop"
+  | "param"
+  | "require"
+  | "trace"
+  | "computed"
+  | "observed"
+  | "observedV2"
   | "link"
   | "objectLink"
   | "provide"
@@ -147,6 +161,7 @@ export class ArkTSAnalyzer {
       target: ts.ScriptTarget.ES2022,
       module: ts.ModuleKind.NodeNext,
       moduleResolution: ts.ModuleResolutionKind.NodeNext,
+      lib: ["es2022"],
       allowNonTsExtensions: true,
       experimentalDecorators: true,
       strict: true,
@@ -164,7 +179,7 @@ export class ArkTSAnalyzer {
 
   public setRootNames(rootNames: string[]): void {
     this.rootNames = [...rootNames];
-    this.rebuildProgram();
+    this.rebuildProgram(withArkTSIntrinsics(this.rootNames));
   }
 
   public setInMemoryFile(input: AnalyzeTextInput): void {
@@ -182,6 +197,26 @@ export class ArkTSAnalyzer {
     this.inMemoryFiles.delete(fileName);
     this.bumpScriptVersion(fileName);
     this.rebuildProgram();
+  }
+
+  public syncWorkspaceFiles(input: {
+    rootNames: string[];
+    changedFiles?: readonly string[];
+    removedFiles?: readonly string[];
+  }): void {
+    const previousRootNames = new Set(this.rootNames);
+    const nextRootNames = dedupeFileNames(input.rootNames);
+    const addedFiles = nextRootNames.filter((fileName) => !previousRootNames.has(fileName));
+    const changedFileNames = dedupeFileNames([
+      ...(input.changedFiles ?? []),
+      ...(input.removedFiles ?? []),
+      ...addedFiles,
+    ]);
+
+    this.rootNames = [...nextRootNames];
+    this.rebuildProgram(
+      changedFileNames.length > 0 ? withArkTSIntrinsics(changedFileNames) : undefined,
+    );
   }
 
   public getProgram(): ts.Program {
@@ -381,11 +416,15 @@ export class ArkTSAnalyzer {
       .filter((item): item is DocumentSymbol => item !== undefined);
   }
 
-  public rebuildProgram(): void {
+  public rebuildProgram(changedFileNames?: readonly string[]): void {
     this.host = this.createHost();
     this.program = this.createProgram(this.rootNames);
     this.languageService = this.createLanguageService();
-    this.bumpScriptVersions(withArkTSIntrinsics(this.rootNames));
+    if (changedFileNames) {
+      this.bumpScriptVersions(changedFileNames);
+    } else {
+      this.bumpScriptVersions(withArkTSIntrinsics(this.rootNames));
+    }
   }
 
   private createHost(): ts.CompilerHost {
@@ -446,6 +485,8 @@ export class ArkTSAnalyzer {
             start,
             start + Math.max(length, 0),
           ),
+          confidence: "high",
+          reason: "Produced directly by the lexical scanner.",
         });
       },
     );
@@ -471,6 +512,7 @@ export class ArkTSAnalyzer {
 
       if (
         classDecorators.includes(ARKTS_COMPONENT_DECORATOR) ||
+        classDecorators.includes(ARKTS_COMPONENT_V2_DECORATOR) ||
         classDecorators.includes(ARKTS_ENTRY_DECORATOR)
       ) {
         const decoratedMembers = node.members.flatMap((member) =>
@@ -489,7 +531,7 @@ export class ArkTSAnalyzer {
           isEntry,
           componentDecorators: classDecorators,
           stateMembers: decoratedMembers
-            .filter((member) => member.kind === "state")
+            .filter((member) => STATE_LIKE_MEMBER_KINDS.has(member.kind))
             .map((member) => ({
               name: member.name,
               decorator: member.decorator,
@@ -597,6 +639,11 @@ export class ArkTSAnalyzer {
         sourceFile,
         diagnostic.start,
         diagnostic.start + (diagnostic.length ?? 0),
+      ),
+      ...getDiagnosticConfidence(
+        ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n"),
+        diagnostic.code,
+        category,
       ),
     };
   }
@@ -1060,6 +1107,10 @@ function getDeclarationRank(
 const ARKTS_DECORATED_MEMBER_KIND_BY_DECORATOR = {
   [ARKTS_STATE_DECORATOR]: "state",
   [ARKTS_PROP_DECORATOR]: "prop",
+  [ARKTS_PARAM_DECORATOR]: "param",
+  [ARKTS_REQUIRE_DECORATOR]: "require",
+  [ARKTS_TRACE_DECORATOR]: "trace",
+  [ARKTS_COMPUTED_DECORATOR]: "computed",
   [ARKTS_LINK_DECORATOR]: "link",
   [ARKTS_OBJECT_LINK_DECORATOR]: "objectLink",
   [ARKTS_PROVIDE_DECORATOR]: "provide",
@@ -1075,7 +1126,19 @@ const ARKTS_DECORATED_MEMBER_KIND_BY_DECORATOR = {
 const ARKTS_TRACKED_DECORATED_MEMBER_DECORATORS = new Set<string>([
   ...Object.keys(ARKTS_DECORATED_MEMBER_KIND_BY_DECORATOR),
   ARKTS_WATCH_DECORATOR,
+  ARKTS_BUILDER_DECORATOR,
 ]);
+
+const STATE_LIKE_MEMBER_KINDS = new Set<DecoratedMemberKind>(["state", "local"]);
+
+const LOW_CONFIDENCE_DIAGNOSTIC_PATTERNS = [
+  /Cannot find module '@kit\.[^']+'/,
+  /Cannot find name '(?:Row|Column|Text|Button|Image|List|ListItem|ListItemGroup|Scroll|Stack|Blank|Circle|Divider|TextInput|TextArea|Toggle|Slider|Scroller|PanGesture|TapGesture|LongPressGesture|LoadingProgress)'/,
+  /Cannot find name '(?:width|height|fontSize|fontColor|margin|padding|backgroundColor|fontWeight|layoutWeight|textAlign|justifyContent|constraintSize|opacity|shadow|animation|onClick|onChange|onTouch|enabled|scrollBar|clip|transition|objectFit|position|zIndex|visibility|placeholderColor|bindSheet|hitTestBehavior)'/,
+  /Cannot find name '(?:\$r|animateTo|getContext|AlertDialog|Color|FontWeight|TextAlign|TextOverflow|ButtonType|Curve|FlexAlign|HorizontalAlign|VerticalAlign|ImageFit|ScrollAlign|TouchType|HitTestMode|PlayMode|Alignment|Visibility|ItemAlign|BarState|EdgeEffect|ToggleType|PanDirection|TransitionEffect|TransitionType|TransitionDirection|Axis|WordBreak|InputType|SafeAreaType|SafeAreaEdge|AvoidAreaType)'/,
+  /Value of type '\{ new \(data\?: string \| undefined\): Text; prototype: Text; \}' is not callable/,
+  /Value of type 'new \(width\?: number \| undefined, height\?: number \| undefined\) => HTMLImageElement' is not callable/,
+] as const;
 
 function isTrackedDecoratedMemberDecorator(decorator: string): boolean {
   return ARKTS_TRACKED_DECORATED_MEMBER_DECORATORS.has(decorator);
@@ -1089,6 +1152,33 @@ function getDecoratedMemberKind(decorator: string): DecoratedMemberKind {
   }
 
   return "other";
+}
+
+function getDiagnosticConfidence(
+  message: string,
+  code: number,
+  category: AnalyzerDiagnostic["category"],
+): Pick<AnalyzerDiagnostic, "confidence" | "reason"> {
+  if (category === "lexical") {
+    return {
+      confidence: "high",
+      reason: "Produced directly by the lexical scanner.",
+    };
+  }
+
+  if (LOW_CONFIDENCE_DIAGNOSTIC_PATTERNS.some((pattern) => pattern.test(message))) {
+    return {
+      confidence: "low",
+      reason: "Matches an ArkTS/OHOS compatibility gap pattern.",
+    };
+  }
+
+  return {
+    confidence: "high",
+    reason: code === 2304 || code === 2307
+      ? "Unresolved symbol outside the ArkTS compatibility allowlist."
+      : "Produced by the TypeScript semantic/syntactic pipeline.",
+  };
 }
 
 function dedupeFileNames(fileNames: Iterable<string>): string[] {

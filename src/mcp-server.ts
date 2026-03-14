@@ -100,6 +100,12 @@ interface ExternalDecoratedMemberInfo {
   kind:
     | "state"
     | "prop"
+    | "param"
+    | "require"
+    | "trace"
+    | "computed"
+    | "observed"
+    | "observedV2"
     | "link"
     | "objectLink"
     | "provide"
@@ -130,6 +136,8 @@ interface ExternalDiagnostic {
   code: number;
   message: string;
   range: ExternalRange;
+  confidence: "high" | "low";
+  reason?: string | undefined;
 }
 
 interface ExternalDefinitionLocation {
@@ -273,6 +281,12 @@ const componentOutputSchema = {
           kind: z.enum([
             "state",
             "prop",
+            "param",
+            "require",
+            "trace",
+            "computed",
+            "observed",
+            "observedV2",
             "link",
             "objectLink",
             "provide",
@@ -311,6 +325,12 @@ const componentSummarySchema = z.object({
       kind: z.enum([
         "state",
         "prop",
+        "param",
+        "require",
+        "trace",
+        "computed",
+        "observed",
+        "observedV2",
         "link",
         "objectLink",
         "provide",
@@ -337,6 +357,8 @@ const diagnosticsOutputSchema = {
       code: z.number().int(),
       message: z.string(),
       range: rangeSchema,
+      confidence: z.enum(["high", "low"]),
+      reason: z.string().optional(),
     }),
   ),
 } as const;
@@ -533,6 +555,10 @@ const refreshWorkspaceOutputSchema = {
   symbolCount: z.number().int(),
   edgeCount: z.number().int(),
   cacheStatus: z.enum(["memory", "hit", "rebuilt"]),
+  refreshMode: z.enum(["full", "incremental"]),
+  changedFileCount: z.number().int(),
+  reindexedFileCount: z.number().int(),
+  reusedFileCount: z.number().int(),
 } as const;
 
 export function createArkTSMcpServer(): McpServer {
@@ -1302,6 +1328,8 @@ function toExternalDiagnostic(diagnostic: AnalyzerDiagnostic): ExternalDiagnosti
     code: diagnostic.code,
     message: diagnostic.message,
     range: toExternalRange(diagnostic.range),
+    confidence: diagnostic.confidence,
+    reason: diagnostic.reason,
   };
 }
 

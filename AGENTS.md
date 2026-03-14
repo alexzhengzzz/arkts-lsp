@@ -17,6 +17,17 @@ Use this order when it fits the task:
 9. `arkts_find_definition`
 10. `arkts_refresh_workspace` when files changed or cache looks stale
 
+## Repo Map
+
+- Package entry exports live in `src/index.ts`.
+- MCP stdio server setup and tool registration live in `src/mcp-server.ts`.
+- Single-file ArkTS language analysis lives in `src/core/arkts-analyzer.ts`.
+- ArkTS compiler/language host glue lives in `src/core/compiler-host.ts` and `src/core/arkts-language.ts`.
+- Workspace indexing, snapshot persistence, symbol search, and dependency tracing live in `src/workspace/workspace-service.ts`.
+- Shared workspace-facing result types live in `src/workspace/types.ts`.
+- Integration and regression coverage live in `test/*.test.mjs`.
+- Sample ArkTS fixture workspace for MCP tests lives in `test/fixtures/sample_test`.
+
 ## Required Behavior
 
 - Prefer MCP tools for repository-level analysis instead of scanning many files with shell commands.
@@ -28,11 +39,23 @@ Use this order when it fits the task:
 - When using `arkts_find_definition`, remember the position is 1-based `line` and `character`.
 - When the user asks for a summary of a repo problem, first build repo context with MCP, then drill into a small number of files.
 
-## Output Preference
+## Documentation Sync
 
-- Summarize findings in Chinese unless the user asks for another language.
-- For repository investigations, report:
+- Keep `README.md` aligned with the actual exported server behavior in `src/mcp-server.ts`.
+- When adding, removing, or renaming MCP tools, update the README tool list in the same change.
+- When changing startup commands, Node version requirements, or package scripts, update the README quick-start section.
+- When changing repo-specific agent workflow or preferred analysis order, update this `AGENTS.md` in the same change.
+- Use `test/mcp-server.test.mjs` as the source of truth for the expected tool inventory.
+
+## Preferred Investigation Output
+
+- For repository investigations, identify:
   - entry files
   - key modules
   - dependency relationships
   - likely next files to inspect
+- When the answer depends on workspace indexing behavior, mention whether the result comes from snapshot data or direct analyzer output.
+
+## Output Preference
+
+- Summarize findings in Chinese unless the user asks for another language.

@@ -27,7 +27,7 @@ export interface StateMemberSummary {
     decorator: string;
     range: ExternalRange;
 }
-export type DecoratedMemberSummaryKind = "state" | "prop" | "link" | "objectLink" | "provide" | "consume" | "storageProp" | "storageLink" | "localStorageProp" | "localStorageLink" | "builderParam" | "local" | "other";
+export type DecoratedMemberSummaryKind = "state" | "prop" | "param" | "require" | "trace" | "computed" | "observed" | "observedV2" | "link" | "objectLink" | "provide" | "consume" | "storageProp" | "storageLink" | "localStorageProp" | "localStorageLink" | "builderParam" | "local" | "other";
 export interface DecoratedMemberSummary {
     name: string;
     decorator: string;
@@ -178,4 +178,8 @@ export interface RefreshResult {
     symbolCount: number;
     edgeCount: number;
     cacheStatus: WorkspaceCacheStatus;
+    refreshMode: "full" | "incremental";
+    changedFileCount: number;
+    reindexedFileCount: number;
+    reusedFileCount: number;
 }

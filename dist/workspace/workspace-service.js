@@ -50,10 +50,15 @@ export class WorkspaceService {
     optionsHash;
     cacheFile;
     snapshot = null;
+    baseAnalyzer = null;
     fileStates = [];
     discoveredFiles = [];
     truncated = false;
     cacheStatus = "rebuilt";
+    filesByName = new Map();
+    symbolsByFile = new Map();
+    outgoingEdgesByFile = new Map();
+    incomingEdgesByFile = new Map();
     constructor(workspaceRoot, options) {
         this.workspaceRoot = workspaceRoot;
         this.options = options;
@@ -77,16 +82,63 @@ export class WorkspaceService {
         };
     }
     async refresh(changedFiles = []) {
-        const normalizedChangedFiles = changedFiles.map((fileName) => this.resolveWorkspacePath(fileName));
-        await this.rebuildSnapshot();
-        return {
-            workspaceId: this.workspaceId,
-            refreshedFiles: normalizedChangedFiles,
-            fileCount: this.requireSnapshot().fileCount,
-            symbolCount: this.requireSnapshot().symbolCount,
-            edgeCount: this.requireSnapshot().edgeCount,
-            cacheStatus: this.cacheStatus,
-        };
+        const normalizedChangedFiles = dedupePaths(changedFiles.map((fileName) => this.resolveWorkspacePath(fileName)));
+        const discovery = await discoverWorkspaceFiles(this.workspaceRoot, this.options);
+        if (this.baseAnalyzer === null ||
+            (normalizedChangedFiles.length === 0 && (this.truncated || discovery.truncated))) {
+            await this.rebuildSnapshot(discovery);
+            return this.createRefreshResult({
+                refreshedFiles: normalizedChangedFiles,
+                refreshMode: "full",
+                changedFileCount: normalizedChangedFiles.length,
+                reindexedFileCount: this.requireSnapshot().fileCount,
+                reusedFileCount: 0,
+            });
+        }
+        const nextDiscoveredFiles = discovery.fileNames;
+        const nextFileStates = await collectFileStates(nextDiscoveredFiles);
+        const diff = normalizedChangedFiles.length > 0
+            ? diffChangedWorkspaceFiles(normalizedChangedFiles, this.discoveredFiles, nextDiscoveredFiles)
+            : diffWorkspaceFileStates(this.fileStates, nextFileStates);
+        const changedFileSet = dedupePaths([
+            ...diff.addedFiles,
+            ...diff.removedFiles,
+            ...diff.modifiedFiles,
+        ]);
+        this.discoveredFiles = nextDiscoveredFiles;
+        this.truncated = discovery.truncated;
+        this.fileStates = nextFileStates;
+        if (changedFileSet.length === 0) {
+            return this.createRefreshResult({
+                refreshedFiles: normalizedChangedFiles.length > 0 ? normalizedChangedFiles : changedFileSet,
+                refreshMode: "incremental",
+                changedFileCount: 0,
+                reindexedFileCount: 0,
+                reusedFileCount: this.discoveredFiles.length,
+            });
+        }
+        const reindexedFiles = this.collectAffectedFiles(changedFileSet)
+            .filter((fileName) => this.discoveredFiles.includes(fileName));
+        this.baseAnalyzer.syncWorkspaceFiles({
+            rootNames: this.discoveredFiles,
+            changedFiles: [...diff.addedFiles, ...diff.modifiedFiles],
+            removedFiles: diff.removedFiles,
+        });
+        this.removeIndexedFiles([...diff.removedFiles, ...reindexedFiles]);
+        for (const fileName of reindexedFiles) {
+            this.indexFileSummary(this.createFileSummary(this.baseAnalyzer, fileName));
+        }
+        this.rebuildIncomingEdgesIndex();
+        this.setSnapshot(this.createSnapshotFromIndexes());
+        this.cacheStatus = "rebuilt";
+        await this.persistSnapshot();
+        return this.createRefreshResult({
+            refreshedFiles: normalizedChangedFiles.length > 0 ? normalizedChangedFiles : changedFileSet,
+            refreshMode: "incremental",
+            changedFileCount: changedFileSet.length,
+            reindexedFileCount: reindexedFiles.length,
+            reusedFileCount: Math.max(this.discoveredFiles.length - reindexedFiles.length, 0),
+        });
     }
     async summarizeFile(fileName, overlays = []) {
         const snapshot = this.requireSnapshot();
@@ -133,19 +185,18 @@ export class WorkspaceService {
         };
     }
     async getRelatedFiles(options) {
-        const snapshot = this.requireSnapshot();
         const limit = clamp(options.limit ?? 6, 1, 20);
         const targetFile = this.resolveTargetFile(options.targetFile, options.symbolQuery);
-        const summary = snapshot.files.find((file) => file.fileName === targetFile);
+        const summary = this.filesByName.get(targetFile);
         if (!summary) {
             throw new Error(`Target file is not indexed in workspace: ${targetFile}`);
         }
-        const outgoing = snapshot.moduleEdges.filter((edge) => edge.from === targetFile);
-        const incoming = snapshot.moduleEdges.filter((edge) => edge.to === targetFile);
+        const outgoing = this.outgoingEdgesByFile.get(targetFile) ?? [];
+        const incoming = this.incomingEdgesByFile.get(targetFile) ?? [];
         const rankedFiles = new Map();
         rankedFiles.set(targetFile, await this.createContextFile(summary, "self", "Primary target file."));
         for (const edge of outgoing) {
-            const dependency = snapshot.files.find((file) => file.fileName === edge.to);
+            const dependency = this.filesByName.get(edge.to);
             if (!dependency || rankedFiles.has(dependency.fileName)) {
                 continue;
             }
@@ -156,7 +207,7 @@ export class WorkspaceService {
         }
         if (rankedFiles.size < limit) {
             for (const edge of incoming) {
-                const importer = snapshot.files.find((file) => file.fileName === edge.from);
+                const importer = this.filesByName.get(edge.from);
                 if (!importer || rankedFiles.has(importer.fileName)) {
                     continue;
                 }
@@ -168,9 +219,9 @@ export class WorkspaceService {
         }
         if (rankedFiles.size < limit) {
             for (const edge of outgoing) {
-                const transitiveEdges = snapshot.moduleEdges.filter((candidate) => candidate.from === edge.to);
+                const transitiveEdges = this.outgoingEdgesByFile.get(edge.to) ?? [];
                 for (const transitiveEdge of transitiveEdges) {
-                    const dependency = snapshot.files.find((file) => file.fileName === transitiveEdge.to);
+                    const dependency = this.filesByName.get(transitiveEdge.to);
                     if (!dependency || rankedFiles.has(dependency.fileName)) {
                         continue;
                     }
@@ -205,31 +256,30 @@ export class WorkspaceService {
     }
     getHover(fileName, position, overlays = []) {
         const normalizedFileName = this.resolveWorkspacePath(fileName);
-        const analyzer = this.createAnalyzer(overlays, [normalizedFileName]);
+        const analyzer = this.getQueryAnalyzer(normalizedFileName, overlays);
         return analyzer.getHover(normalizedFileName, position);
     }
     findReferences(fileName, position, overlays = []) {
         const normalizedFileName = this.resolveWorkspacePath(fileName);
-        const analyzer = this.createAnalyzer(overlays, [normalizedFileName]);
+        const analyzer = this.getQueryAnalyzer(normalizedFileName, overlays);
         return analyzer.findReferences(normalizedFileName, position);
     }
     findImplementations(fileName, position, overlays = []) {
         const normalizedFileName = this.resolveWorkspacePath(fileName);
-        const analyzer = this.createAnalyzer(overlays, [normalizedFileName]);
+        const analyzer = this.getQueryAnalyzer(normalizedFileName, overlays);
         return analyzer.findImplementations(normalizedFileName, position);
     }
     findTypeDefinitions(fileName, position, overlays = []) {
         const normalizedFileName = this.resolveWorkspacePath(fileName);
-        const analyzer = this.createAnalyzer(overlays, [normalizedFileName]);
+        const analyzer = this.getQueryAnalyzer(normalizedFileName, overlays);
         return analyzer.findTypeDefinitions(normalizedFileName, position);
     }
     getDocumentSymbols(fileName, overlays = []) {
         const normalizedFileName = this.resolveWorkspacePath(fileName);
-        const analyzer = this.createAnalyzer(overlays, [normalizedFileName]);
+        const analyzer = this.getQueryAnalyzer(normalizedFileName, overlays);
         return analyzer.getDocumentSymbols(normalizedFileName);
     }
     async traceDependencies(options) {
-        const snapshot = this.requireSnapshot();
         const targetFile = this.resolveTargetFile(options.targetFile, options.symbolQuery);
         const depth = clamp(options.depth ?? 2, 1, 5);
         const limit = clamp(options.limit ?? 25, 1, 100);
@@ -244,7 +294,7 @@ export class WorkspaceService {
                 continue;
             }
             visited.add(current.fileName);
-            const summary = snapshot.files.find((file) => file.fileName === current.fileName);
+            const summary = this.filesByName.get(current.fileName);
             if (!summary) {
                 continue;
             }
@@ -260,7 +310,7 @@ export class WorkspaceService {
             if (current.depth >= depth) {
                 continue;
             }
-            const outgoing = snapshot.moduleEdges.filter((edge) => edge.from === current.fileName);
+            const outgoing = this.outgoingEdgesByFile.get(current.fileName) ?? [];
             for (const edge of outgoing) {
                 if (!edges.some((candidate) => isSameEdge(candidate, edge))) {
                     edges.push(edge);
@@ -292,30 +342,120 @@ export class WorkspaceService {
                 persisted.optionsHash === this.optionsHash &&
                 persisted.truncated === this.truncated &&
                 areFileStatesEqual(persisted.fileStates, fileStates)) {
-                this.snapshot = persisted.snapshot;
+                this.setSnapshot(persisted.snapshot);
                 this.fileStates = fileStates;
+                this.baseAnalyzer = this.createBaseAnalyzer(this.discoveredFiles);
                 this.cacheStatus = "hit";
                 return;
             }
         }
-        await this.rebuildSnapshot();
+        await this.rebuildSnapshot(discovery);
     }
-    async rebuildSnapshot() {
-        const discovery = await discoverWorkspaceFiles(this.workspaceRoot, this.options);
-        this.discoveredFiles = discovery.fileNames;
-        this.truncated = discovery.truncated;
-        const buildResult = await this.buildSnapshot(this.discoveredFiles, this.truncated);
-        this.snapshot = buildResult.snapshot;
-        this.fileStates = buildResult.fileStates;
+    async rebuildSnapshot(discovery) {
+        const nextDiscovery = discovery ?? await discoverWorkspaceFiles(this.workspaceRoot, this.options);
+        this.discoveredFiles = nextDiscovery.fileNames;
+        this.truncated = nextDiscovery.truncated;
+        this.baseAnalyzer = this.createBaseAnalyzer(this.discoveredFiles);
+        const fileSummaries = this.discoveredFiles.map((fileName) => this.createFileSummary(this.baseAnalyzer, fileName));
+        this.setSnapshot(this.createSnapshotFromFileSummaries(fileSummaries));
+        this.fileStates = await collectFileStates(this.discoveredFiles);
         this.cacheStatus = "rebuilt";
         await this.persistSnapshot();
     }
-    async buildSnapshot(fileNames, truncated) {
-        const analyzer = new ArkTSAnalyzer({
+    createSnapshotFromFileSummaries(fileSummaries) {
+        const sortedFiles = [...fileSummaries].sort((left, right) => left.fileName.localeCompare(right.fileName));
+        const moduleEdges = dedupeModuleEdges(sortedFiles.flatMap((file) => this.createModuleEdges(file))).sort((left, right) => left.from.localeCompare(right.from) ||
+            left.to.localeCompare(right.to) ||
+            left.specifier.localeCompare(right.specifier) ||
+            left.kind.localeCompare(right.kind));
+        const symbols = sortedFiles
+            .flatMap((file) => this.createSymbolRecords(file))
+            .sort((left, right) => left.name.localeCompare(right.name) ||
+            left.fileName.localeCompare(right.fileName));
+        const hotFiles = computeHotFiles(sortedFiles, moduleEdges);
+        const entryFiles = sortedFiles
+            .filter((file) => file.role === "entrypoint")
+            .map((file) => file.fileName);
+        const timestamp = new Date().toISOString();
+        return {
+            version: WORKSPACE_SNAPSHOT_VERSION,
+            workspaceId: this.workspaceId,
+            workspaceRoot: this.workspaceRoot,
+            createdAt: this.snapshot?.createdAt ?? timestamp,
+            updatedAt: timestamp,
+            fileCount: sortedFiles.length,
+            symbolCount: symbols.length,
+            edgeCount: moduleEdges.length,
+            truncated: this.truncated,
+            maxFiles: this.options.maxFiles,
+            include: [...this.options.include],
+            exclude: [...this.options.exclude],
+            entryFiles,
+            hotFiles,
+            files: sortedFiles,
+            symbols,
+            moduleEdges,
+            overviewText: createWorkspaceOverviewText(sortedFiles.length, symbols.length, moduleEdges.length, entryFiles.length, this.truncated),
+        };
+    }
+    createSnapshotFromIndexes() {
+        return this.createSnapshotFromFileSummaries([...this.filesByName.values()]);
+    }
+    createBaseAnalyzer(fileNames) {
+        return new ArkTSAnalyzer({
             rootNames: fileNames,
         });
-        const fileSummaries = fileNames.map((fileName) => this.createFileSummary(analyzer, fileName));
-        const moduleEdges = dedupeModuleEdges(fileSummaries.flatMap((file) => file.imports
+    }
+    createRefreshResult(input) {
+        const snapshot = this.requireSnapshot();
+        return {
+            workspaceId: this.workspaceId,
+            refreshedFiles: input.refreshedFiles,
+            fileCount: snapshot.fileCount,
+            symbolCount: snapshot.symbolCount,
+            edgeCount: snapshot.edgeCount,
+            cacheStatus: this.cacheStatus,
+            refreshMode: input.refreshMode,
+            changedFileCount: input.changedFileCount,
+            reindexedFileCount: input.reindexedFileCount,
+            reusedFileCount: input.reusedFileCount,
+        };
+    }
+    setSnapshot(snapshot) {
+        this.snapshot = snapshot;
+        this.filesByName.clear();
+        this.symbolsByFile.clear();
+        this.outgoingEdgesByFile.clear();
+        this.incomingEdgesByFile.clear();
+        for (const file of snapshot.files) {
+            this.filesByName.set(file.fileName, file);
+        }
+        for (const symbol of snapshot.symbols) {
+            const symbols = this.symbolsByFile.get(symbol.fileName) ?? [];
+            symbols.push(symbol);
+            this.symbolsByFile.set(symbol.fileName, symbols);
+        }
+        for (const edge of snapshot.moduleEdges) {
+            const outgoing = this.outgoingEdgesByFile.get(edge.from) ?? [];
+            outgoing.push(edge);
+            this.outgoingEdgesByFile.set(edge.from, outgoing);
+            const incoming = this.incomingEdgesByFile.get(edge.to) ?? [];
+            incoming.push(edge);
+            this.incomingEdgesByFile.set(edge.to, incoming);
+        }
+    }
+    createSymbolRecords(file) {
+        return file.topLevelSymbols.map((symbol) => ({
+            name: symbol.name,
+            kind: symbol.kind,
+            fileName: file.fileName,
+            relativePath: file.relativePath,
+            range: symbol.range,
+            exported: symbol.exported,
+        }));
+    }
+    createModuleEdges(file) {
+        return file.imports
             .filter((record) => record.resolvedPath !== null)
             .map((record) => ({
             from: file.fileName,
@@ -323,49 +463,46 @@ export class WorkspaceService {
             kind: record.kind,
             specifier: record.specifier,
             symbols: record.importedSymbols,
-        }))));
-        const symbols = fileSummaries
-            .flatMap((file) => file.topLevelSymbols.map((symbol) => ({
-            name: symbol.name,
-            kind: symbol.kind,
-            fileName: file.fileName,
-            relativePath: file.relativePath,
-            range: symbol.range,
-            exported: symbol.exported,
-        })))
-            .sort((left, right) => left.name.localeCompare(right.name) ||
-            left.fileName.localeCompare(right.fileName));
-        const hotFiles = computeHotFiles(fileSummaries, moduleEdges);
-        const entryFiles = fileSummaries
-            .filter((file) => file.role === "entrypoint")
-            .map((file) => file.fileName);
-        const fileStates = await collectFileStates(fileNames);
-        const timestamp = new Date().toISOString();
-        const snapshot = {
-            version: WORKSPACE_SNAPSHOT_VERSION,
-            workspaceId: this.workspaceId,
-            workspaceRoot: this.workspaceRoot,
-            createdAt: this.snapshot?.createdAt ?? timestamp,
-            updatedAt: timestamp,
-            fileCount: fileSummaries.length,
-            symbolCount: symbols.length,
-            edgeCount: moduleEdges.length,
-            truncated,
-            maxFiles: this.options.maxFiles,
-            include: [...this.options.include],
-            exclude: [...this.options.exclude],
-            entryFiles,
-            hotFiles,
-            files: fileSummaries.sort((left, right) => left.fileName.localeCompare(right.fileName)),
-            symbols,
-            moduleEdges,
-            overviewText: createWorkspaceOverviewText(fileSummaries.length, symbols.length, moduleEdges.length, entryFiles.length, truncated),
-        };
-        return {
-            snapshot,
-            fileStates,
-            truncated,
-        };
+        }));
+    }
+    removeIndexedFiles(fileNames) {
+        for (const fileName of dedupePaths(fileNames)) {
+            this.filesByName.delete(fileName);
+            this.symbolsByFile.delete(fileName);
+            this.outgoingEdgesByFile.delete(fileName);
+        }
+    }
+    indexFileSummary(fileSummary) {
+        this.filesByName.set(fileSummary.fileName, fileSummary);
+        this.symbolsByFile.set(fileSummary.fileName, this.createSymbolRecords(fileSummary));
+        this.outgoingEdgesByFile.set(fileSummary.fileName, this.createModuleEdges(fileSummary));
+    }
+    rebuildIncomingEdgesIndex() {
+        this.incomingEdgesByFile.clear();
+        for (const outgoingEdges of this.outgoingEdgesByFile.values()) {
+            for (const edge of outgoingEdges) {
+                const incoming = this.incomingEdgesByFile.get(edge.to) ?? [];
+                incoming.push(edge);
+                this.incomingEdgesByFile.set(edge.to, incoming);
+            }
+        }
+    }
+    collectAffectedFiles(changedFiles) {
+        const queue = [...changedFiles];
+        const visited = new Set();
+        while (queue.length > 0) {
+            const current = queue.shift();
+            if (!current || visited.has(current)) {
+                continue;
+            }
+            visited.add(current);
+            for (const edge of this.incomingEdgesByFile.get(current) ?? []) {
+                if (!visited.has(edge.from)) {
+                    queue.push(edge.from);
+                }
+            }
+        }
+        return [...visited].sort((left, right) => left.localeCompare(right));
     }
     createFileSummary(analyzer, fileName) {
         const sourceFile = analyzer.getSourceFile(fileName);
@@ -408,6 +545,14 @@ export class WorkspaceService {
             });
         }
         return analyzer;
+    }
+    getQueryAnalyzer(normalizedFileName, overlays) {
+        if (overlays.length === 0 &&
+            this.baseAnalyzer &&
+            this.discoveredFiles.includes(normalizedFileName)) {
+            return this.baseAnalyzer;
+        }
+        return this.createAnalyzer(overlays, [normalizedFileName]);
     }
     async persistSnapshot() {
         const snapshot = this.requireSnapshot();
@@ -572,6 +717,48 @@ function areFileStatesEqual(left, right) {
             other.size === fileState.size &&
             other.mtimeMs === fileState.mtimeMs);
     });
+}
+function diffWorkspaceFileStates(previousStates, nextStates) {
+    const previousByFile = new Map(previousStates.map((state) => [state.fileName, state]));
+    const nextByFile = new Map(nextStates.map((state) => [state.fileName, state]));
+    const addedFiles = [...nextByFile.keys()].filter((fileName) => !previousByFile.has(fileName));
+    const removedFiles = [...previousByFile.keys()].filter((fileName) => !nextByFile.has(fileName));
+    const modifiedFiles = [...nextByFile.entries()]
+        .filter(([fileName, nextState]) => {
+        const previousState = previousByFile.get(fileName);
+        return (previousState !== undefined &&
+            (previousState.size !== nextState.size ||
+                previousState.mtimeMs !== nextState.mtimeMs));
+    })
+        .map(([fileName]) => fileName);
+    return {
+        addedFiles: addedFiles.sort((left, right) => left.localeCompare(right)),
+        removedFiles: removedFiles.sort((left, right) => left.localeCompare(right)),
+        modifiedFiles: modifiedFiles.sort((left, right) => left.localeCompare(right)),
+    };
+}
+function diffChangedWorkspaceFiles(changedFiles, previousFiles, nextFiles) {
+    const previousSet = new Set(previousFiles);
+    const nextSet = new Set(nextFiles);
+    const addedFiles = [];
+    const removedFiles = [];
+    const modifiedFiles = [];
+    for (const fileName of dedupePaths(changedFiles)) {
+        if (nextSet.has(fileName) && !previousSet.has(fileName)) {
+            addedFiles.push(fileName);
+        }
+        else if (!nextSet.has(fileName) && previousSet.has(fileName)) {
+            removedFiles.push(fileName);
+        }
+        else if (nextSet.has(fileName)) {
+            modifiedFiles.push(fileName);
+        }
+    }
+    return {
+        addedFiles,
+        removedFiles,
+        modifiedFiles,
+    };
 }
 function extractFileFacts(sourceFile, workspaceRoot, fileName) {
     const imports = [];

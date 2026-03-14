@@ -1,3 +1,4 @@
+import path from "node:path";
 import ts from "typescript";
 import { ARKTS_INTRINSICS_FILE_NAME, getArkTSIntrinsicsSource, isArkTSFile, isArkTSIntrinsicFile, normalizeArkTSSource, } from "./arkts-language.js";
 export function createArkTSCompilerHost(compilerOptions, options = {}) {
@@ -7,6 +8,7 @@ export function createArkTSCompilerHost(compilerOptions, options = {}) {
     const originalGetSourceFile = host.getSourceFile.bind(host);
     const originalDirectoryExists = host.directoryExists?.bind(host);
     const originalGetDirectories = host.getDirectories?.bind(host);
+    const resolutionHost = createModuleResolutionHost(system, inMemoryFiles, currentDirectoryFromSystem(system));
     host.fileExists = (fileName) => {
         return (isArkTSIntrinsicFile(fileName) ||
             inMemoryFiles.has(fileName) ||
@@ -42,6 +44,7 @@ export function createArkTSCompilerHost(compilerOptions, options = {}) {
         }
         return originalGetSourceFile(fileName, languageVersionOrOptions, onError, shouldCreateNewSourceFile);
     };
+    host.resolveModuleNames = (moduleNames, containingFile) => moduleNames.map((moduleName) => resolveModuleNameWithArkTSFallback(moduleName, containingFile, compilerOptions, resolutionHost));
     return host;
 }
 export function createArkTSLanguageServiceHost(rootNames, compilerOptions, options = {}) {
@@ -50,6 +53,7 @@ export function createArkTSLanguageServiceHost(rootNames, compilerOptions, optio
     const versions = options.versions ?? new Map();
     const currentDirectory = options.currentDirectory ?? system.getCurrentDirectory();
     const scriptFileNames = withArkTSIntrinsics(rootNames);
+    const resolutionHost = createModuleResolutionHost(system, inMemoryFiles, currentDirectory);
     const host = {
         getCompilationSettings: () => compilerOptions,
         getCurrentDirectory: () => currentDirectory,
@@ -78,6 +82,7 @@ export function createArkTSLanguageServiceHost(rootNames, compilerOptions, optio
             const virtualDirectories = getVirtualDirectories(inMemoryFiles, directoryName);
             return [...new Set([...systemDirectories, ...virtualDirectories])];
         },
+        resolveModuleNames: (moduleNames, containingFile) => moduleNames.map((moduleName) => resolveModuleNameWithArkTSFallback(moduleName, containingFile, compilerOptions, resolutionHost)),
         readDirectory: system.readDirectory?.bind(system),
         useCaseSensitiveFileNames: () => system.useCaseSensitiveFileNames,
     };
@@ -118,6 +123,60 @@ function inferScriptKind(fileName) {
         return ts.ScriptKind.JSON;
     }
     return ts.ScriptKind.TS;
+}
+function createModuleResolutionHost(system, inMemoryFiles, currentDirectory) {
+    const host = {
+        fileExists: (fileName) => isArkTSIntrinsicFile(fileName) ||
+            inMemoryFiles.has(fileName) ||
+            system.fileExists(fileName),
+        readFile: (fileName) => readSourceText(fileName, inMemoryFiles, system),
+        directoryExists: (directoryName) => hasVirtualDirectory(inMemoryFiles, directoryName) ||
+            system.directoryExists?.(directoryName) ||
+            false,
+        getDirectories: (directoryName) => {
+            const systemDirectories = system.getDirectories?.(directoryName) ?? [];
+            const virtualDirectories = getVirtualDirectories(inMemoryFiles, directoryName);
+            return [...new Set([...systemDirectories, ...virtualDirectories])];
+        },
+        useCaseSensitiveFileNames: system.useCaseSensitiveFileNames,
+        getCurrentDirectory: () => currentDirectory,
+    };
+    if (system.realpath) {
+        host.realpath = system.realpath.bind(system);
+    }
+    return host;
+}
+function resolveModuleNameWithArkTSFallback(moduleName, containingFile, compilerOptions, resolutionHost) {
+    const resolved = ts.resolveModuleName(moduleName, containingFile, compilerOptions, resolutionHost).resolvedModule;
+    if (resolved) {
+        return resolved;
+    }
+    if (!moduleName.startsWith(".")) {
+        return undefined;
+    }
+    const containingDirectory = path.dirname(containingFile);
+    const resolvedBase = path.resolve(containingDirectory, moduleName);
+    const candidates = [
+        `${resolvedBase}.ets`,
+        `${resolvedBase}.ts`,
+        path.join(resolvedBase, "index.ets"),
+        path.join(resolvedBase, "index.ts"),
+    ];
+    for (const candidate of candidates) {
+        if (!resolutionHost.fileExists(candidate)) {
+            continue;
+        }
+        const resolvedModule = {
+            resolvedFileName: candidate,
+            extension: ts.Extension.Ts,
+            isExternalLibraryImport: false,
+        };
+        return resolvedModule;
+    }
+    return undefined;
+}
+function currentDirectoryFromSystem(system) {
+    return system.getCurrentDirectory();
 }
 function hasVirtualDirectory(inMemoryFiles, directoryName) {
     const normalizedDirectoryName = normalizePath(directoryName);

@@ -300,6 +300,150 @@ struct Dashboard {
   });
 });
 
+test("arkts_analyze_components recognizes ComponentV2 and V2 member decorators", async () => {
+  const source = `@ComponentV2
+struct Dashboard {
+  @Param @Require title: string;
+  @Local count: number = 0;
+  @Computed summary: string = "ready";
+
+  build() {}
+
+  @Builder
+  buildFooter() {}
+}
+`;
+
+  await withClient({}, async (client) => {
+    const result = await client.callTool({
+      name: "arkts_analyze_components",
+      arguments: {
+        targetFile: "virtual/component-v2.ets",
+        files: [
+          {
+            fileName: "virtual/component-v2.ets",
+            content: source,
+          },
+        ],
+      },
+    });
+    const data = getStructuredContent(result);
+
+    assert.equal(data.components.length, 1);
+    assert.deepEqual(data.components[0].componentDecorators, ["ComponentV2"]);
+    assert.deepEqual(
+      data.components[0].stateMembers.map((member) => `${member.name}:${member.decorator}`),
+      ["count:Local"],
+    );
+    assert.deepEqual(
+      data.components[0].decoratedMembers.map((member) => `${member.name}:${member.decorator}:${member.kind}`),
+      [
+        "title:Param:param",
+        "title:Require:require",
+        "count:Local:local",
+        "summary:Computed:computed",
+        "buildFooter:Builder:other",
+      ],
+    );
+  });
+});
+
+test("arkts_get_diagnostics accepts AI-OHOSAPP-style ComponentV2 UI DSL without compatibility noise", async () => {
+  const source = `import { router, curves } from '@kit.ArkUI';
+import { BusinessError } from '@kit.BasicServicesKit';
+
+@ObservedV2
+class PanelState {
+  @Trace count: number = 0;
+}
+
+@ComponentV2
+struct Dashboard {
+  @Param @Require title: string;
+  @Local count: number = 0;
+  @Computed summary: string = "ready";
+
+  build() {
+    Column() {
+      Text(this.title)
+        .fontSize(16)
+        .fontWeight(FontWeight.Bold)
+      Button() {
+        Text("Go")
+          .fontColor(Color.White)
+      }
+      .type(ButtonType.Capsule)
+      .onClick(() => {
+        animateTo({ curve: Curve.EaseInOut }, () => {
+          this.count += 1;
+        });
+      })
+    }
+    .width('100%')
+    .backgroundColor($r('app.color.primary'))
+
+    void router;
+    void curves;
+    void BusinessError;
+  }
+
+  @Builder
+  buildFooter() {
+    Row() {
+      Blank();
+    }
+  }
+}
+`;
+
+  await withClient({}, async (client) => {
+    const result = await client.callTool({
+      name: "arkts_get_diagnostics",
+      arguments: {
+        targetFile: "virtual/component-v2-ui.ets",
+        files: [
+          {
+            fileName: "virtual/component-v2-ui.ets",
+            content: source,
+          },
+        ],
+      },
+    });
+    const data = getStructuredContent(result);
+
+    assert.ok(
+      data.diagnostics.every(
+        (diagnostic) =>
+          !diagnostic.message.includes("Cannot find module '@kit.") &&
+          !diagnostic.message.includes("Cannot find name 'ComponentV2'") &&
+          !diagnostic.message.includes("Cannot find name 'ObservedV2'") &&
+          !diagnostic.message.includes("Cannot find name 'Trace'") &&
+          !diagnostic.message.includes("Cannot find name 'Param'") &&
+          !diagnostic.message.includes("Cannot find name 'Require'") &&
+          !diagnostic.message.includes("Cannot find name 'Computed'") &&
+          !diagnostic.message.includes("Cannot find name 'Local'") &&
+          !diagnostic.message.includes("Cannot find name 'Builder'") &&
+          !diagnostic.message.includes("Cannot find name 'Column'") &&
+          !diagnostic.message.includes("Cannot find name 'Row'") &&
+          !diagnostic.message.includes("Cannot find name 'Text'") &&
+          !diagnostic.message.includes("Cannot find name 'Button'") &&
+          !diagnostic.message.includes("Cannot find name '$r'") &&
+          !diagnostic.message.includes("Cannot find name 'animateTo'") &&
+          !diagnostic.message.includes("Cannot find name 'Color'") &&
+          !diagnostic.message.includes("Cannot find name 'FontWeight'") &&
+          !diagnostic.message.includes("Cannot find name 'Curve'") &&
+          !diagnostic.message.includes("Cannot find name 'ButtonType'"),
+      ),
+    );
+    assert.ok(
+      data.diagnostics.every(
+        (diagnostic) =>
+          diagnostic.confidence === "high" || diagnostic.confidence === "low",
+      ),
+    );
+  });
+});
+
 test("arkts_find_definition resolves imported aliases and returns null for intrinsic decorators", async () => {
   const mainSource = `import { externalValue as aliasedValue } from "./helper.ts";
 
@@ -574,6 +718,10 @@ struct App {
       });
       const refresh = getStructuredContent(refreshResult);
       assert.equal(refresh.fileCount, 4);
+      assert.equal(refresh.refreshMode, "incremental");
+      assert.equal(refresh.changedFileCount, 1);
+      assert.equal(refresh.reindexedFileCount, 3);
+      assert.equal(refresh.reusedFileCount, 1);
 
       const refreshedSymbolResult = await client.callTool({
         name: "arkts_find_symbol",

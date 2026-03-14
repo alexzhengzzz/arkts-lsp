@@ -1,3 +1,5 @@
+import path from "node:path";
+
 import ts from "typescript";
 import {
   ARKTS_INTRINSICS_FILE_NAME,
@@ -27,6 +29,7 @@ export function createArkTSCompilerHost(
   const originalGetSourceFile = host.getSourceFile.bind(host);
   const originalDirectoryExists = host.directoryExists?.bind(host);
   const originalGetDirectories = host.getDirectories?.bind(host);
+  const resolutionHost = createModuleResolutionHost(system, inMemoryFiles, currentDirectoryFromSystem(system));
 
   host.fileExists = (fileName) => {
     return (
@@ -100,6 +103,16 @@ export function createArkTSCompilerHost(
     );
   };
 
+  host.resolveModuleNames = (moduleNames, containingFile) =>
+    moduleNames.map((moduleName) =>
+      resolveModuleNameWithArkTSFallback(
+        moduleName,
+        containingFile,
+        compilerOptions,
+        resolutionHost,
+      ),
+    );
+
   return host;
 }
 
@@ -113,6 +126,7 @@ export function createArkTSLanguageServiceHost(
   const versions = options.versions ?? new Map<string, string>();
   const currentDirectory = options.currentDirectory ?? system.getCurrentDirectory();
   const scriptFileNames = withArkTSIntrinsics(rootNames);
+  const resolutionHost = createModuleResolutionHost(system, inMemoryFiles, currentDirectory);
   const host: ts.LanguageServiceHost = {
     getCompilationSettings: () => compilerOptions,
     getCurrentDirectory: () => currentDirectory,
@@ -146,6 +160,15 @@ export function createArkTSLanguageServiceHost(
 
       return [...new Set([...systemDirectories, ...virtualDirectories])];
     },
+    resolveModuleNames: (moduleNames, containingFile) =>
+      moduleNames.map((moduleName) =>
+        resolveModuleNameWithArkTSFallback(
+          moduleName,
+          containingFile,
+          compilerOptions,
+          resolutionHost,
+        ),
+      ),
     readDirectory: system.readDirectory?.bind(system),
     useCaseSensitiveFileNames: () => system.useCaseSensitiveFileNames,
   };
@@ -204,6 +227,89 @@ function inferScriptKind(fileName: string): ts.ScriptKind {
   }
 
   return ts.ScriptKind.TS;
+}
+
+function createModuleResolutionHost(
+  system: ts.System,
+  inMemoryFiles: ReadonlyMap<string, string>,
+  currentDirectory: string,
+): ts.ModuleResolutionHost {
+  const host: ts.ModuleResolutionHost = {
+    fileExists: (fileName) =>
+      isArkTSIntrinsicFile(fileName) ||
+      inMemoryFiles.has(fileName) ||
+      system.fileExists(fileName),
+    readFile: (fileName) => readSourceText(fileName, inMemoryFiles, system),
+    directoryExists: (directoryName) =>
+      hasVirtualDirectory(inMemoryFiles, directoryName) ||
+      system.directoryExists?.(directoryName) ||
+      false,
+    getDirectories: (directoryName) => {
+      const systemDirectories = system.getDirectories?.(directoryName) ?? [];
+      const virtualDirectories = getVirtualDirectories(inMemoryFiles, directoryName);
+
+      return [...new Set([...systemDirectories, ...virtualDirectories])];
+    },
+    useCaseSensitiveFileNames: system.useCaseSensitiveFileNames,
+    getCurrentDirectory: () => currentDirectory,
+  };
+
+  if (system.realpath) {
+    host.realpath = system.realpath.bind(system);
+  }
+
+  return host;
+}
+
+function resolveModuleNameWithArkTSFallback(
+  moduleName: string,
+  containingFile: string,
+  compilerOptions: ts.CompilerOptions,
+  resolutionHost: ts.ModuleResolutionHost,
+): ts.ResolvedModule | undefined {
+  const resolved = ts.resolveModuleName(
+    moduleName,
+    containingFile,
+    compilerOptions,
+    resolutionHost,
+  ).resolvedModule;
+
+  if (resolved) {
+    return resolved;
+  }
+
+  if (!moduleName.startsWith(".")) {
+    return undefined;
+  }
+
+  const containingDirectory = path.dirname(containingFile);
+  const resolvedBase = path.resolve(containingDirectory, moduleName);
+  const candidates = [
+    `${resolvedBase}.ets`,
+    `${resolvedBase}.ts`,
+    path.join(resolvedBase, "index.ets"),
+    path.join(resolvedBase, "index.ts"),
+  ];
+
+  for (const candidate of candidates) {
+    if (!resolutionHost.fileExists(candidate)) {
+      continue;
+    }
+
+    const resolvedModule: ts.ResolvedModuleFull = {
+      resolvedFileName: candidate,
+      extension: ts.Extension.Ts,
+      isExternalLibraryImport: false,
+    };
+
+    return resolvedModule;
+  }
+
+  return undefined;
+}
+
+function currentDirectoryFromSystem(system: ts.System): string {
+  return system.getCurrentDirectory();
 }
 
 function hasVirtualDirectory(

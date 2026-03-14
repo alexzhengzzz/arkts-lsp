@@ -72,6 +72,33 @@ struct App {
 `,
       },
     ]);
+    const initialDocumentSymbols = service.getDocumentSymbols("src/App.ets");
+    const overlayDocumentSymbols = service.getDocumentSymbols("src/App.ets", [
+      {
+        fileName: "src/App.ets",
+        content: `import { Card } from "./Card.ets";
+import { greet } from "./utils/helper.ts";
+
+@Preview
+@Entry
+@Component
+struct App {
+  @State count: number = 0;
+
+  build() {
+    greet();
+    const card = new Card();
+    return card;
+  }
+
+  footer(): string {
+    return "footer";
+  }
+}
+`,
+      },
+    ]);
+    const finalDocumentSymbols = service.getDocumentSymbols("src/App.ets");
 
     assert.deepEqual(
       overlaySummary.components[0]?.stateMembers.map((member) => member.name),
@@ -91,6 +118,8 @@ struct App {
       ],
     );
     assert.match(overlaySummary.summary, /recognized decorated member\(s\)/);
+    assert.notDeepEqual(overlayDocumentSymbols, initialDocumentSymbols);
+    assert.deepEqual(finalDocumentSymbols, initialDocumentSymbols);
 
     const relatedFiles = await service.getRelatedFiles({
       targetFile: "src/App.ets",
@@ -111,10 +140,79 @@ struct App {
 `,
       "utf8",
     );
-    await service.refresh(["src/utils/helper.ts"]);
+    const refreshResult = await service.refresh(["src/utils/helper.ts"]);
     const refreshedSymbols = service.findSymbol("renamedHelper", { limit: 5 });
 
+    assert.equal(refreshResult.refreshMode, "incremental");
+    assert.equal(refreshResult.changedFileCount, 1);
+    assert.equal(refreshResult.reindexedFileCount, 3);
+    assert.equal(refreshResult.reusedFileCount, 1);
     assert.equal(refreshedSymbols.matches[0]?.fileName, workspace.helperFile);
+  } finally {
+    WorkspaceService.resetForTests();
+    await rm(workspace.root, { recursive: true, force: true });
+  }
+});
+
+test("WorkspaceService incrementally diffs workspace changes when refresh is called without explicit changed files", async () => {
+  const workspace = await createWorkspaceFixture("arkts-workspace-diff-refresh-");
+  const cacheDir = path.join(workspace.root, ".cache-test");
+  const newHelperFile = path.join(workspace.root, "src", "utils", "new-helper.ts");
+
+  try {
+    WorkspaceService.resetForTests();
+    const service = await WorkspaceService.initialize(workspace.root, {
+      cacheDir,
+    });
+
+    await writeFile(
+      workspace.appFile,
+      `import { Card } from "./Card.ets";
+import { featureFlag } from "./utils/new-helper.ts";
+
+@Entry
+@Component
+struct App {
+  @State count: number = featureFlag;
+  build() {
+    const card = new Card();
+    return card;
+  }
+}
+`,
+      "utf8",
+    );
+    await writeFile(
+      newHelperFile,
+      `export const featureFlag = 2;
+`,
+      "utf8",
+    );
+    await writeFile(
+      workspace.barrelFile,
+      `export { featureFlag } from "./utils/new-helper.ts";
+`,
+      "utf8",
+    );
+    await rm(workspace.helperFile, { force: true });
+
+    const refreshResult = await service.refresh();
+    const featureSymbols = service.findSymbol("featureFlag", { limit: 5 });
+    const greetSymbols = service.findSymbol("greet", { limit: 5 });
+    const trace = await service.traceDependencies({
+      targetFile: "src/App.ets",
+      depth: 2,
+    });
+
+    assert.equal(refreshResult.refreshMode, "incremental");
+    assert.equal(refreshResult.changedFileCount, 4);
+    assert.equal(refreshResult.reindexedFileCount, 3);
+    assert.equal(refreshResult.reusedFileCount, 1);
+    assert.equal(service.getOverview().fileCount, 4);
+    assert.equal(featureSymbols.matches[0]?.fileName, newHelperFile);
+    assert.equal(greetSymbols.matches.length, 0);
+    assert.ok(trace.edges.some((edge) => edge.to === newHelperFile));
+    assert.ok(trace.edges.every((edge) => edge.to !== workspace.helperFile));
   } finally {
     WorkspaceService.resetForTests();
     await rm(workspace.root, { recursive: true, force: true });

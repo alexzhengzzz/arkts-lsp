@@ -1,6 +1,7 @@
 import ts from "typescript";
 export const ARKTS_INTRINSICS_FILE_NAME = "__arkts_intrinsics__.d.ts";
 export const ARKTS_COMPONENT_DECORATOR = "Component";
+export const ARKTS_COMPONENT_V2_DECORATOR = "ComponentV2";
 export const ARKTS_ENTRY_DECORATOR = "Entry";
 export const ARKTS_STATE_DECORATOR = "State";
 export const ARKTS_PREVIEW_DECORATOR = "Preview";
@@ -18,12 +19,25 @@ export const ARKTS_LOCAL_STORAGE_LINK_DECORATOR = "LocalStorageLink";
 export const ARKTS_BUILDER_PARAM_DECORATOR = "BuilderParam";
 export const ARKTS_LOCAL_DECORATOR = "Local";
 export const ARKTS_WATCH_DECORATOR = "Watch";
-export const ARKTS_CLASS_DECORATORS = [
+export const ARKTS_BUILDER_DECORATOR = "Builder";
+export const ARKTS_PARAM_DECORATOR = "Param";
+export const ARKTS_REQUIRE_DECORATOR = "Require";
+export const ARKTS_TRACE_DECORATOR = "Trace";
+export const ARKTS_COMPUTED_DECORATOR = "Computed";
+export const ARKTS_OBSERVED_DECORATOR = "Observed";
+export const ARKTS_OBSERVED_V2_DECORATOR = "ObservedV2";
+export const ARKTS_COMPONENT_CLASS_DECORATORS = [
     ARKTS_ENTRY_DECORATOR,
     ARKTS_COMPONENT_DECORATOR,
+    ARKTS_COMPONENT_V2_DECORATOR,
     ARKTS_PREVIEW_DECORATOR,
     ARKTS_CUSTOM_DIALOG_DECORATOR,
     ARKTS_REUSABLE_DECORATOR,
+];
+export const ARKTS_CLASS_DECORATORS = [
+    ...ARKTS_COMPONENT_CLASS_DECORATORS,
+    ARKTS_OBSERVED_DECORATOR,
+    ARKTS_OBSERVED_V2_DECORATOR,
 ];
 export const ARKTS_PROPERTY_DECORATORS = [
     ARKTS_STATE_DECORATOR,
@@ -38,13 +52,139 @@ export const ARKTS_PROPERTY_DECORATORS = [
     ARKTS_LOCAL_STORAGE_LINK_DECORATOR,
     ARKTS_BUILDER_PARAM_DECORATOR,
     ARKTS_LOCAL_DECORATOR,
+    ARKTS_PARAM_DECORATOR,
+    ARKTS_REQUIRE_DECORATOR,
+    ARKTS_TRACE_DECORATOR,
+    ARKTS_COMPUTED_DECORATOR,
 ];
-export const ARKTS_METHOD_DECORATORS = [ARKTS_WATCH_DECORATOR];
+export const ARKTS_METHOD_DECORATORS = [
+    ARKTS_WATCH_DECORATOR,
+    ARKTS_BUILDER_DECORATOR,
+];
 export const ARKTS_INTRINSIC_DECORATORS = [
     ...ARKTS_CLASS_DECORATORS,
     ...ARKTS_PROPERTY_DECORATORS,
     ...ARKTS_METHOD_DECORATORS,
 ];
+export const ARKTS_UI_COMPONENT_NAMES = [
+    "Blank",
+    "Button",
+    "Circle",
+    "Column",
+    "Divider",
+    "ForEach",
+    "Image",
+    "List",
+    "ListItem",
+    "ListItemGroup",
+    "LoadingProgress",
+    "LongPressGesture",
+    "PanGesture",
+    "RichText",
+    "Row",
+    "Scroll",
+    "Scroller",
+    "Slider",
+    "Stack",
+    "TapGesture",
+    "Text",
+    "TextArea",
+    "TextInput",
+    "Toggle",
+];
+const ARKTS_UI_BLOCK_COMPONENT_NAMES = new Set([
+    "Button",
+    "Column",
+    "List",
+    "ListItem",
+    "ListItemGroup",
+    "PanGesture",
+    "Row",
+    "Scroll",
+    "Stack",
+]);
+const ARKTS_GLOBAL_VALUE_NAMES = [
+    "$r",
+    "AlertDialog",
+    "Alignment",
+    "AnimationPresets",
+    "AnimationType",
+    "AppStorage",
+    "AudioChannel",
+    "AudioEncodingType",
+    "AudioSampleFormat",
+    "AudioSamplingRate",
+    "AudioState",
+    "AvoidAreaType",
+    "Axis",
+    "BarState",
+    "ButtonType",
+    "Color",
+    "CopyOptions",
+    "Curve",
+    "EdgeEffect",
+    "FlexAlign",
+    "FontWeight",
+    "GestureEvent",
+    "HitTestMode",
+    "HorizontalAlign",
+    "ImageFit",
+    "InputType",
+    "ItemAlign",
+    "NestedScrollMode",
+    "OpenMode",
+    "PanDirection",
+    "PlayMode",
+    "RequestMethod",
+    "SafeAreaEdge",
+    "SafeAreaType",
+    "ScrollAlign",
+    "ScrollDirection",
+    "TextAlign",
+    "TextOverflow",
+    "ThemeMode",
+    "ToggleType",
+    "TouchType",
+    "TransitionDirection",
+    "TransitionEffect",
+    "TransitionType",
+    "VerticalAlign",
+    "Visibility",
+    "WordBreak",
+    "animateTo",
+    "getContext",
+];
+const ARKTS_KIT_MODULE_EXPORTS = {
+    "@kit.AbilityKit": [
+        "AbilityConstant",
+        "Configuration",
+        "ConfigurationConstant",
+        "UIAbility",
+        "Want",
+        "abilityAccessCtrl",
+        "common",
+    ],
+    "@kit.ArkData": ["preferences"],
+    "@kit.ArkUI": [
+        "SimpleAnimationManager",
+        "SimpleAnimationPresets",
+        "SimpleAnimationUtils",
+        "curves",
+        "display",
+        "promptAction",
+        "router",
+        "window",
+    ],
+    "@kit.AudioKit": ["audio"],
+    "@kit.BasicServicesKit": ["BusinessError", "pasteboard", "systemDateTime"],
+    "@kit.CoreFileKit": ["BackupExtensionAbility", "BundleVersion", "fileIo", "picker"],
+    "@kit.CoreSpeechKit": ["speechRecognizer", "textToSpeech"],
+    "@kit.IMEKit": ["inputMethod"],
+    "@kit.LocalizationKit": ["resourceManager"],
+    "@kit.NetworkKit": ["http", "webSocket"],
+    "@kit.PerformanceAnalysisKit": ["hilog"],
+    "@kit.SensorServiceKit": ["vibrator"],
+};
 const ARKTS_DECORATOR_LIKE_TYPE_NAME = "ArkTSDecoratorLike";
 const ARKTS_INTRINSICS_SOURCE = createArkTSIntrinsicsSource();
 export function isArkTSFile(fileName) {
@@ -60,7 +200,8 @@ export function normalizeArkTSSource(fileName, sourceText) {
     if (!isArkTSFile(fileName)) {
         return sourceText;
     }
-    const scanner = ts.createScanner(ts.ScriptTarget.Latest, true, ts.LanguageVariant.Standard, sourceText);
+    const blockNormalizedText = normalizeArkTSComponentBlocks(sourceText);
+    const scanner = ts.createScanner(ts.ScriptTarget.Latest, true, ts.LanguageVariant.Standard, blockNormalizedText);
     const replacements = [];
     for (let token = scanner.scan(); token !== ts.SyntaxKind.EndOfFileToken; token = scanner.scan()) {
         if (token === ts.SyntaxKind.Identifier &&
@@ -73,9 +214,9 @@ export function normalizeArkTSSource(fileName, sourceText) {
         }
     }
     if (replacements.length === 0) {
-        return sourceText;
+        return blockNormalizedText;
     }
-    let normalizedText = sourceText;
+    let normalizedText = blockNormalizedText;
     for (let index = replacements.length - 1; index >= 0; index -= 1) {
         const replacement = replacements[index];
         if (!replacement) {
@@ -102,10 +243,126 @@ function isStructDeclarationKeyword(scanner) {
 function createArkTSIntrinsicsSource() {
     const lines = [
         `type ${ARKTS_DECORATOR_LIKE_TYPE_NAME}<TDecorator> = TDecorator & ((...args: unknown[]) => TDecorator);`,
+        "interface ArkTSChainable {",
+        "  [member: string]: any;",
+        "}",
+        "type ArkTSComponentFactory = (...args: unknown[]) => ArkTSChainable;",
         ...ARKTS_CLASS_DECORATORS.map((decorator) => `declare const ${decorator}: ${ARKTS_DECORATOR_LIKE_TYPE_NAME}<ClassDecorator>;`),
         ...ARKTS_PROPERTY_DECORATORS.map((decorator) => `declare const ${decorator}: ${ARKTS_DECORATOR_LIKE_TYPE_NAME}<PropertyDecorator>;`),
         ...ARKTS_METHOD_DECORATORS.map((decorator) => `declare const ${decorator}: ${ARKTS_DECORATOR_LIKE_TYPE_NAME}<MethodDecorator>;`),
+        ...ARKTS_UI_COMPONENT_NAMES.map((name) => `declare const ${name}: ArkTSComponentFactory;`),
+        ...ARKTS_GLOBAL_VALUE_NAMES.map((name) => name === "$r"
+            ? "declare function $r(...args: unknown[]): any;"
+            : name === "animateTo" || name === "getContext"
+                ? `declare function ${name}(...args: unknown[]): any;`
+                : `declare const ${name}: any;`),
+        ...Object.entries(ARKTS_KIT_MODULE_EXPORTS).flatMap(([moduleName, exports]) => [
+            `declare module "${moduleName}" {`,
+            ...exports.map((name) => `  export const ${name}: any;`),
+            "}",
+        ]),
     ];
     return `\n${lines.join("\n")}\n`;
+}
+function normalizeArkTSComponentBlocks(sourceText) {
+    const blockOpenings = collectArkTSComponentBlockOpenings(sourceText);
+    if (blockOpenings.length === 0) {
+        return sourceText;
+    }
+    const bracePairs = collectBracePairs(sourceText, new Set(blockOpenings.map((opening) => opening.openBrace)));
+    if (bracePairs.size === 0) {
+        return sourceText;
+    }
+    const replacements = [];
+    for (const opening of blockOpenings) {
+        if (!bracePairs.has(opening.openBrace)) {
+            continue;
+        }
+        replacements.push({
+            start: opening.closeParen,
+            end: opening.openBrace + 1,
+            text: opening.hasArguments ? ", () => {" : "() => {",
+        });
+        replacements.push({
+            start: bracePairs.get(opening.openBrace) ?? opening.openBrace,
+            end: (bracePairs.get(opening.openBrace) ?? opening.openBrace) + 1,
+            text: "})",
+        });
+    }
+    replacements.sort((left, right) => left.start - right.start);
+    let normalized = "";
+    let cursor = 0;
+    for (const replacement of replacements) {
+        if (replacement.start < cursor) {
+            continue;
+        }
+        normalized += sourceText.slice(cursor, replacement.start);
+        normalized += replacement.text;
+        cursor = replacement.end;
+    }
+    normalized += sourceText.slice(cursor);
+    return normalized;
+}
+function collectArkTSComponentBlockOpenings(sourceText) {
+    const blockOpenings = [];
+    let lineStart = 0;
+    while (lineStart < sourceText.length) {
+        let lineEnd = sourceText.indexOf("\n", lineStart);
+        if (lineEnd === -1) {
+            lineEnd = sourceText.length;
+        }
+        const lineText = sourceText.slice(lineStart, lineEnd);
+        const trimmedLine = lineText.trim();
+        if (trimmedLine.endsWith("{")) {
+            const identifierMatch = trimmedLine.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*\(/);
+            const lineOpenBrace = lineText.lastIndexOf("{");
+            const lineCloseParen = lineText.lastIndexOf(")", lineOpenBrace);
+            if (identifierMatch?.[1] &&
+                lineOpenBrace >= 0 &&
+                lineCloseParen >= 0 &&
+                ARKTS_UI_BLOCK_COMPONENT_NAMES.has(identifierMatch[1])) {
+                const hasArguments = hasCallArguments(lineText, lineCloseParen);
+                blockOpenings.push({
+                    openBrace: lineStart + lineOpenBrace,
+                    closeParen: lineStart + lineCloseParen,
+                    hasArguments,
+                });
+            }
+        }
+        lineStart = lineEnd + 1;
+    }
+    return blockOpenings;
+}
+function collectBracePairs(sourceText, openBracePositions) {
+    const pairs = new Map();
+    for (const openBrace of openBracePositions) {
+        let depth = 0;
+        for (let index = openBrace; index < sourceText.length; index += 1) {
+            const character = sourceText[index];
+            if (character === "{") {
+                depth += 1;
+                continue;
+            }
+            if (character !== "}") {
+                continue;
+            }
+            depth -= 1;
+            if (depth === 0) {
+                pairs.set(openBrace, index);
+                break;
+            }
+        }
+    }
+    return pairs;
+}
+function hasCallArguments(lineText, closeParen) {
+    for (let index = closeParen - 1; index >= 0; index -= 1) {
+        const character = lineText[index];
+        if (character === undefined || /\s/.test(character)) {
+            continue;
+        }
+        return character !== "(";
+    }
+    return false;
 }
 //# sourceMappingURL=arkts-language.js.map

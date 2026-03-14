@@ -36,6 +36,12 @@ export interface StateMemberSummary {
 export type DecoratedMemberSummaryKind =
   | "state"
   | "prop"
+  | "param"
+  | "require"
+  | "trace"
+  | "computed"
+  | "observed"
+  | "observedV2"
   | "link"
   | "objectLink"
   | "provide"
@@ -218,4 +224,8 @@ export interface RefreshResult {
   symbolCount: number;
   edgeCount: number;
   cacheStatus: WorkspaceCacheStatus;
+  refreshMode: "full" | "incremental";
+  changedFileCount: number;
+  reindexedFileCount: number;
+  reusedFileCount: number;
 }

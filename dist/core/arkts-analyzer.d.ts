@@ -22,13 +22,15 @@ export interface AnalyzerDiagnostic {
     code: number;
     message: string;
     range: AnalyzerRange;
+    confidence: "high" | "low";
+    reason?: string | undefined;
 }
 export interface StateMemberInfo {
     name: string;
     decorator: string;
     range: AnalyzerRange;
 }
-export type DecoratedMemberKind = "state" | "prop" | "link" | "objectLink" | "provide" | "consume" | "storageProp" | "storageLink" | "localStorageProp" | "localStorageLink" | "builderParam" | "local" | "other";
+export type DecoratedMemberKind = "state" | "prop" | "param" | "require" | "trace" | "computed" | "observed" | "observedV2" | "link" | "objectLink" | "provide" | "consume" | "storageProp" | "storageLink" | "localStorageProp" | "localStorageLink" | "builderParam" | "local" | "other";
 export interface DecoratedMemberInfo {
     name: string;
     decorator: string;
@@ -91,6 +93,11 @@ export declare class ArkTSAnalyzer {
     setRootNames(rootNames: string[]): void;
     setInMemoryFile(input: AnalyzeTextInput): void;
     removeInMemoryFile(fileName: string): void;
+    syncWorkspaceFiles(input: {
+        rootNames: string[];
+        changedFiles?: readonly string[];
+        removedFiles?: readonly string[];
+    }): void;
     getProgram(): ts.Program;
     getSourceFile(fileName: string): ts.SourceFile | undefined;
     collectDiagnostics(fileName?: string): AnalyzerDiagnostic[];
@@ -101,7 +108,7 @@ export declare class ArkTSAnalyzer {
     findImplementations(fileName: string, position: AnalyzerPosition): DefinitionLocation[];
     findTypeDefinitions(fileName: string, position: AnalyzerPosition): DefinitionLocation[];
     getDocumentSymbols(fileName: string): DocumentSymbol[];
-    rebuildProgram(): void;
+    rebuildProgram(changedFileNames?: readonly string[]): void;
     private createHost;
     private createLanguageService;
     private createProgram;

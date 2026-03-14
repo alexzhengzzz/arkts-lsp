@@ -130,6 +130,168 @@ struct Dashboard {
   );
 });
 
+test("collectDiagnostics accepts AI-OHOSAPP-style ComponentV2 UI DSL without compatibility noise", () => {
+  const fileName = "/virtual/component-v2.ets";
+  const analyzer = new ArkTSAnalyzer({
+    rootNames: [fileName],
+  });
+
+  analyzer.setInMemoryFile({
+    fileName,
+    content: `import { router, curves } from '@kit.ArkUI';
+import { BusinessError } from '@kit.BasicServicesKit';
+
+@ObservedV2
+class PanelState {
+  @Trace count: number = 0;
+}
+
+@ComponentV2
+struct Dashboard {
+  @Param @Require title: string;
+  @Local count: number = 0;
+  @Computed summary: string = "ready";
+
+  build() {
+    Column() {
+      Text(this.title)
+        .fontSize(16)
+        .fontWeight(FontWeight.Bold)
+      Button() {
+        Text("Go")
+          .fontColor(Color.White)
+      }
+      .type(ButtonType.Capsule)
+      .onClick(() => {
+        animateTo({ curve: Curve.EaseInOut }, () => {
+          this.count += 1;
+        });
+      })
+    }
+    .width('100%')
+    .backgroundColor($r('app.color.primary'))
+
+    void router;
+    void curves;
+    void BusinessError;
+  }
+
+  @Builder
+  buildFooter() {
+    Row() {
+      Blank();
+    }
+  }
+}
+`,
+  });
+
+  const diagnostics = analyzer.collectDiagnostics(fileName);
+
+  assert.ok(
+    diagnostics.every(
+      (diagnostic) =>
+        !diagnostic.message.includes("Cannot find module '@kit.") &&
+        !diagnostic.message.includes("Cannot find name 'ComponentV2'") &&
+        !diagnostic.message.includes("Cannot find name 'ObservedV2'") &&
+        !diagnostic.message.includes("Cannot find name 'Trace'") &&
+        !diagnostic.message.includes("Cannot find name 'Param'") &&
+        !diagnostic.message.includes("Cannot find name 'Require'") &&
+        !diagnostic.message.includes("Cannot find name 'Computed'") &&
+        !diagnostic.message.includes("Cannot find name 'Local'") &&
+        !diagnostic.message.includes("Cannot find name 'Builder'") &&
+        !diagnostic.message.includes("Cannot find name 'Column'") &&
+        !diagnostic.message.includes("Cannot find name 'Row'") &&
+        !diagnostic.message.includes("Cannot find name 'Text'") &&
+        !diagnostic.message.includes("Cannot find name 'Button'") &&
+        !diagnostic.message.includes("Cannot find name '$r'") &&
+        !diagnostic.message.includes("Cannot find name 'animateTo'") &&
+        !diagnostic.message.includes("Cannot find name 'Color'") &&
+        !diagnostic.message.includes("Cannot find name 'FontWeight'") &&
+        !diagnostic.message.includes("Cannot find name 'Curve'") &&
+        !diagnostic.message.includes("Cannot find name 'ButtonType'"),
+    ),
+  );
+});
+
+test("findDecoratedComponents recognizes ComponentV2 and V2 member decorators", () => {
+  const fileName = "/virtual/component-v2-members.ets";
+  const analyzer = new ArkTSAnalyzer({
+    rootNames: [fileName],
+  });
+
+  analyzer.setInMemoryFile({
+    fileName,
+    content: `@ComponentV2
+struct Dashboard {
+  @Param @Require title: string;
+  @Local count: number = 0;
+  @Computed summary: string = "ready";
+
+  build() {}
+
+  @Builder
+  buildFooter() {}
+}
+`,
+  });
+
+  const components = analyzer.findDecoratedComponents(fileName);
+
+  assert.equal(components.length, 1);
+  assert.deepEqual(components[0].componentDecorators, ["ComponentV2"]);
+  assert.deepEqual(
+    components[0].stateMembers.map((member) => `${member.name}:${member.decorator}`),
+    ["count:Local"],
+  );
+  assert.deepEqual(
+    components[0].decoratedMembers.map((member) => `${member.name}:${member.decorator}:${member.kind}`),
+    [
+      "title:Param:param",
+      "title:Require:require",
+      "count:Local:local",
+      "summary:Computed:computed",
+      "buildFooter:Builder:other",
+    ],
+  );
+});
+
+test("collectDiagnostics resolves extensionless relative .ets imports", () => {
+  const entryFileName = "/virtual/main.ets";
+  const helperFileName = "/virtual/helper.ets";
+  const analyzer = new ArkTSAnalyzer({
+    rootNames: [entryFileName, helperFileName],
+  });
+
+  analyzer.setInMemoryFile({
+    fileName: helperFileName,
+    content: `export const message = "hello";
+`,
+  });
+
+  analyzer.setInMemoryFile({
+    fileName: entryFileName,
+    content: `import { message } from "./helper";
+
+@ComponentV2
+struct Home {
+  build() {
+    Text(message)
+  }
+}
+`,
+  });
+
+  const diagnostics = analyzer.collectDiagnostics(entryFileName);
+
+  assert.ok(
+    diagnostics.every(
+      (diagnostic) =>
+        !diagnostic.message.includes("Cannot find module './helper'"),
+    ),
+  );
+});
+
 test("findDecoratedComponents identifies core component decorators and decorated members", () => {
   const fileName = "/virtual/components.ets";
   const analyzer = new ArkTSAnalyzer({

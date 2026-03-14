@@ -71,12 +71,6 @@ interface PersistedWorkspaceSnapshot {
   snapshot: WorkspaceSnapshot;
 }
 
-interface BuildSnapshotResult {
-  snapshot: WorkspaceSnapshot;
-  fileStates: WorkspaceFileState[];
-  truncated: boolean;
-}
-
 interface DiscoverWorkspaceResult {
   fileNames: string[];
   truncated: boolean;
@@ -87,6 +81,12 @@ interface ExtractedFileFacts {
   exports: ExportRecord[];
   topLevelSymbols: TopLevelSymbolSummary[];
   symbolRecords: SymbolRecord[];
+}
+
+interface RefreshDiff {
+  addedFiles: string[];
+  removedFiles: string[];
+  modifiedFiles: string[];
 }
 
 const WORKSPACE_SNAPSHOT_VERSION = "workspace-snapshot-v1";
@@ -141,10 +141,15 @@ export class WorkspaceService {
   private readonly cacheFile: string;
 
   private snapshot: WorkspaceSnapshot | null = null;
+  private baseAnalyzer: ArkTSAnalyzer | null = null;
   private fileStates: WorkspaceFileState[] = [];
   private discoveredFiles: string[] = [];
   private truncated = false;
   private cacheStatus: WorkspaceCacheStatus = "rebuilt";
+  private readonly filesByName = new Map<string, FileSummary>();
+  private readonly symbolsByFile = new Map<string, SymbolRecord[]>();
+  private readonly outgoingEdgesByFile = new Map<string, ModuleEdge[]>();
+  private readonly incomingEdgesByFile = new Map<string, ModuleEdge[]>();
 
   private constructor(
     private readonly workspaceRoot: string,
@@ -172,18 +177,80 @@ export class WorkspaceService {
   }
 
   public async refresh(changedFiles: string[] = []): Promise<RefreshResult> {
-    const normalizedChangedFiles = changedFiles.map((fileName) =>
-      this.resolveWorkspacePath(fileName),
+    const normalizedChangedFiles = dedupePaths(
+      changedFiles.map((fileName) => this.resolveWorkspacePath(fileName)),
     );
-    await this.rebuildSnapshot();
-    return {
-      workspaceId: this.workspaceId,
-      refreshedFiles: normalizedChangedFiles,
-      fileCount: this.requireSnapshot().fileCount,
-      symbolCount: this.requireSnapshot().symbolCount,
-      edgeCount: this.requireSnapshot().edgeCount,
-      cacheStatus: this.cacheStatus,
-    };
+    const discovery = await discoverWorkspaceFiles(this.workspaceRoot, this.options);
+
+    if (
+      this.baseAnalyzer === null ||
+      (normalizedChangedFiles.length === 0 && (this.truncated || discovery.truncated))
+    ) {
+      await this.rebuildSnapshot(discovery);
+      return this.createRefreshResult({
+        refreshedFiles: normalizedChangedFiles,
+        refreshMode: "full",
+        changedFileCount: normalizedChangedFiles.length,
+        reindexedFileCount: this.requireSnapshot().fileCount,
+        reusedFileCount: 0,
+      });
+    }
+
+    const nextDiscoveredFiles = discovery.fileNames;
+    const nextFileStates = await collectFileStates(nextDiscoveredFiles);
+    const diff = normalizedChangedFiles.length > 0
+      ? diffChangedWorkspaceFiles(
+          normalizedChangedFiles,
+          this.discoveredFiles,
+          nextDiscoveredFiles,
+        )
+      : diffWorkspaceFileStates(this.fileStates, nextFileStates);
+    const changedFileSet = dedupePaths([
+      ...diff.addedFiles,
+      ...diff.removedFiles,
+      ...diff.modifiedFiles,
+    ]);
+
+    this.discoveredFiles = nextDiscoveredFiles;
+    this.truncated = discovery.truncated;
+    this.fileStates = nextFileStates;
+
+    if (changedFileSet.length === 0) {
+      return this.createRefreshResult({
+        refreshedFiles: normalizedChangedFiles.length > 0 ? normalizedChangedFiles : changedFileSet,
+        refreshMode: "incremental",
+        changedFileCount: 0,
+        reindexedFileCount: 0,
+        reusedFileCount: this.discoveredFiles.length,
+      });
+    }
+
+    const reindexedFiles = this.collectAffectedFiles(changedFileSet)
+      .filter((fileName) => this.discoveredFiles.includes(fileName));
+
+    this.baseAnalyzer.syncWorkspaceFiles({
+      rootNames: this.discoveredFiles,
+      changedFiles: [...diff.addedFiles, ...diff.modifiedFiles],
+      removedFiles: diff.removedFiles,
+    });
+
+    this.removeIndexedFiles([...diff.removedFiles, ...reindexedFiles]);
+    for (const fileName of reindexedFiles) {
+      this.indexFileSummary(this.createFileSummary(this.baseAnalyzer, fileName));
+    }
+
+    this.rebuildIncomingEdgesIndex();
+    this.setSnapshot(this.createSnapshotFromIndexes());
+    this.cacheStatus = "rebuilt";
+    await this.persistSnapshot();
+
+    return this.createRefreshResult({
+      refreshedFiles: normalizedChangedFiles.length > 0 ? normalizedChangedFiles : changedFileSet,
+      refreshMode: "incremental",
+      changedFileCount: changedFileSet.length,
+      reindexedFileCount: reindexedFiles.length,
+      reusedFileCount: Math.max(this.discoveredFiles.length - reindexedFiles.length, 0),
+    });
   }
 
   public async summarizeFile(
@@ -248,17 +315,16 @@ export class WorkspaceService {
   public async getRelatedFiles(
     options: RelatedFilesOptions,
   ): Promise<ContextBundle> {
-    const snapshot = this.requireSnapshot();
     const limit = clamp(options.limit ?? 6, 1, 20);
     const targetFile = this.resolveTargetFile(options.targetFile, options.symbolQuery);
-    const summary = snapshot.files.find((file) => file.fileName === targetFile);
+    const summary = this.filesByName.get(targetFile);
 
     if (!summary) {
       throw new Error(`Target file is not indexed in workspace: ${targetFile}`);
     }
 
-    const outgoing = snapshot.moduleEdges.filter((edge) => edge.from === targetFile);
-    const incoming = snapshot.moduleEdges.filter((edge) => edge.to === targetFile);
+    const outgoing = this.outgoingEdgesByFile.get(targetFile) ?? [];
+    const incoming = this.incomingEdgesByFile.get(targetFile) ?? [];
     const rankedFiles = new Map<string, ContextFile>();
     rankedFiles.set(
       targetFile,
@@ -266,7 +332,7 @@ export class WorkspaceService {
     );
 
     for (const edge of outgoing) {
-      const dependency = snapshot.files.find((file) => file.fileName === edge.to);
+      const dependency = this.filesByName.get(edge.to);
       if (!dependency || rankedFiles.has(dependency.fileName)) {
         continue;
       }
@@ -287,7 +353,7 @@ export class WorkspaceService {
 
     if (rankedFiles.size < limit) {
       for (const edge of incoming) {
-        const importer = snapshot.files.find((file) => file.fileName === edge.from);
+        const importer = this.filesByName.get(edge.from);
         if (!importer || rankedFiles.has(importer.fileName)) {
           continue;
         }
@@ -309,9 +375,9 @@ export class WorkspaceService {
 
     if (rankedFiles.size < limit) {
       for (const edge of outgoing) {
-        const transitiveEdges = snapshot.moduleEdges.filter((candidate) => candidate.from === edge.to);
+        const transitiveEdges = this.outgoingEdgesByFile.get(edge.to) ?? [];
         for (const transitiveEdge of transitiveEdges) {
-          const dependency = snapshot.files.find((file) => file.fileName === transitiveEdge.to);
+          const dependency = this.filesByName.get(transitiveEdge.to);
           if (!dependency || rankedFiles.has(dependency.fileName)) {
             continue;
           }
@@ -368,7 +434,7 @@ export class WorkspaceService {
     overlays: WorkspaceOverlayFile[] = [],
   ): HoverInfo | undefined {
     const normalizedFileName = this.resolveWorkspacePath(fileName);
-    const analyzer = this.createAnalyzer(overlays, [normalizedFileName]);
+    const analyzer = this.getQueryAnalyzer(normalizedFileName, overlays);
     return analyzer.getHover(normalizedFileName, position);
   }
 
@@ -378,7 +444,7 @@ export class WorkspaceService {
     overlays: WorkspaceOverlayFile[] = [],
   ): ReferenceLocation[] {
     const normalizedFileName = this.resolveWorkspacePath(fileName);
-    const analyzer = this.createAnalyzer(overlays, [normalizedFileName]);
+    const analyzer = this.getQueryAnalyzer(normalizedFileName, overlays);
     return analyzer.findReferences(normalizedFileName, position);
   }
 
@@ -388,7 +454,7 @@ export class WorkspaceService {
     overlays: WorkspaceOverlayFile[] = [],
   ): DefinitionLocation[] {
     const normalizedFileName = this.resolveWorkspacePath(fileName);
-    const analyzer = this.createAnalyzer(overlays, [normalizedFileName]);
+    const analyzer = this.getQueryAnalyzer(normalizedFileName, overlays);
     return analyzer.findImplementations(normalizedFileName, position);
   }
 
@@ -398,7 +464,7 @@ export class WorkspaceService {
     overlays: WorkspaceOverlayFile[] = [],
   ): DefinitionLocation[] {
     const normalizedFileName = this.resolveWorkspacePath(fileName);
-    const analyzer = this.createAnalyzer(overlays, [normalizedFileName]);
+    const analyzer = this.getQueryAnalyzer(normalizedFileName, overlays);
     return analyzer.findTypeDefinitions(normalizedFileName, position);
   }
 
@@ -407,14 +473,13 @@ export class WorkspaceService {
     overlays: WorkspaceOverlayFile[] = [],
   ): DocumentSymbol[] {
     const normalizedFileName = this.resolveWorkspacePath(fileName);
-    const analyzer = this.createAnalyzer(overlays, [normalizedFileName]);
+    const analyzer = this.getQueryAnalyzer(normalizedFileName, overlays);
     return analyzer.getDocumentSymbols(normalizedFileName);
   }
 
   public async traceDependencies(
     options: TraceDependenciesOptions,
   ): Promise<DependencyTrace> {
-    const snapshot = this.requireSnapshot();
     const targetFile = this.resolveTargetFile(options.targetFile, options.symbolQuery);
     const depth = clamp(options.depth ?? 2, 1, 5);
     const limit = clamp(options.limit ?? 25, 1, 100);
@@ -431,7 +496,7 @@ export class WorkspaceService {
       }
 
       visited.add(current.fileName);
-      const summary = snapshot.files.find((file) => file.fileName === current.fileName);
+      const summary = this.filesByName.get(current.fileName);
       if (!summary) {
         continue;
       }
@@ -451,7 +516,7 @@ export class WorkspaceService {
         continue;
       }
 
-      const outgoing = snapshot.moduleEdges.filter((edge) => edge.from === current.fileName);
+      const outgoing = this.outgoingEdgesByFile.get(current.fileName) ?? [];
       for (const edge of outgoing) {
         if (!edges.some((candidate) => isSameEdge(candidate, edge))) {
           edges.push(edge);
@@ -489,101 +554,210 @@ export class WorkspaceService {
         persisted.truncated === this.truncated &&
         areFileStatesEqual(persisted.fileStates, fileStates)
       ) {
-        this.snapshot = persisted.snapshot;
+        this.setSnapshot(persisted.snapshot);
         this.fileStates = fileStates;
+        this.baseAnalyzer = this.createBaseAnalyzer(this.discoveredFiles);
         this.cacheStatus = "hit";
         return;
       }
     }
 
-    await this.rebuildSnapshot();
+    await this.rebuildSnapshot(discovery);
   }
 
-  private async rebuildSnapshot(): Promise<void> {
-    const discovery = await discoverWorkspaceFiles(this.workspaceRoot, this.options);
-    this.discoveredFiles = discovery.fileNames;
-    this.truncated = discovery.truncated;
-    const buildResult = await this.buildSnapshot(this.discoveredFiles, this.truncated);
-    this.snapshot = buildResult.snapshot;
-    this.fileStates = buildResult.fileStates;
+  private async rebuildSnapshot(discovery?: DiscoverWorkspaceResult): Promise<void> {
+    const nextDiscovery = discovery ?? await discoverWorkspaceFiles(this.workspaceRoot, this.options);
+    this.discoveredFiles = nextDiscovery.fileNames;
+    this.truncated = nextDiscovery.truncated;
+    this.baseAnalyzer = this.createBaseAnalyzer(this.discoveredFiles);
+    const fileSummaries = this.discoveredFiles.map((fileName) =>
+      this.createFileSummary(this.baseAnalyzer as ArkTSAnalyzer, fileName),
+    );
+    this.setSnapshot(this.createSnapshotFromFileSummaries(fileSummaries));
+    this.fileStates = await collectFileStates(this.discoveredFiles);
     this.cacheStatus = "rebuilt";
     await this.persistSnapshot();
   }
 
-  private async buildSnapshot(
-    fileNames: string[],
-    truncated: boolean,
-  ): Promise<BuildSnapshotResult> {
-    const analyzer = new ArkTSAnalyzer({
-      rootNames: fileNames,
-    });
-    const fileSummaries = fileNames.map((fileName) => this.createFileSummary(analyzer, fileName));
-    const moduleEdges = dedupeModuleEdges(
-      fileSummaries.flatMap((file) =>
-        file.imports
-          .filter((record) => record.resolvedPath !== null)
-          .map((record) => ({
-            from: file.fileName,
-            to: record.resolvedPath as string,
-            kind: record.kind,
-            specifier: record.specifier,
-            symbols: record.importedSymbols,
-          })),
-      ),
+  private createSnapshotFromFileSummaries(fileSummaries: FileSummary[]): WorkspaceSnapshot {
+    const sortedFiles = [...fileSummaries].sort((left, right) =>
+      left.fileName.localeCompare(right.fileName),
     );
-    const symbols = fileSummaries
-      .flatMap((file) =>
-        file.topLevelSymbols.map((symbol) => ({
-          name: symbol.name,
-          kind: symbol.kind,
-          fileName: file.fileName,
-          relativePath: file.relativePath,
-          range: symbol.range,
-          exported: symbol.exported,
-        })),
-      )
+    const moduleEdges = dedupeModuleEdges(
+      sortedFiles.flatMap((file) => this.createModuleEdges(file)),
+    ).sort((left, right) =>
+      left.from.localeCompare(right.from) ||
+      left.to.localeCompare(right.to) ||
+      left.specifier.localeCompare(right.specifier) ||
+      left.kind.localeCompare(right.kind),
+    );
+    const symbols = sortedFiles
+      .flatMap((file) => this.createSymbolRecords(file))
       .sort((left, right) =>
         left.name.localeCompare(right.name) ||
         left.fileName.localeCompare(right.fileName),
       );
-    const hotFiles = computeHotFiles(fileSummaries, moduleEdges);
-    const entryFiles = fileSummaries
+    const hotFiles = computeHotFiles(sortedFiles, moduleEdges);
+    const entryFiles = sortedFiles
       .filter((file) => file.role === "entrypoint")
       .map((file) => file.fileName);
-    const fileStates = await collectFileStates(fileNames);
     const timestamp = new Date().toISOString();
-    const snapshot: WorkspaceSnapshot = {
+
+    return {
       version: WORKSPACE_SNAPSHOT_VERSION,
       workspaceId: this.workspaceId,
       workspaceRoot: this.workspaceRoot,
       createdAt: this.snapshot?.createdAt ?? timestamp,
       updatedAt: timestamp,
-      fileCount: fileSummaries.length,
+      fileCount: sortedFiles.length,
       symbolCount: symbols.length,
       edgeCount: moduleEdges.length,
-      truncated,
+      truncated: this.truncated,
       maxFiles: this.options.maxFiles,
       include: [...this.options.include],
       exclude: [...this.options.exclude],
       entryFiles,
       hotFiles,
-      files: fileSummaries.sort((left, right) => left.fileName.localeCompare(right.fileName)),
+      files: sortedFiles,
       symbols,
       moduleEdges,
       overviewText: createWorkspaceOverviewText(
-        fileSummaries.length,
+        sortedFiles.length,
         symbols.length,
         moduleEdges.length,
         entryFiles.length,
-        truncated,
+        this.truncated,
       ),
     };
+  }
 
+  private createSnapshotFromIndexes(): WorkspaceSnapshot {
+    return this.createSnapshotFromFileSummaries([...this.filesByName.values()]);
+  }
+
+  private createBaseAnalyzer(fileNames: string[]): ArkTSAnalyzer {
+    return new ArkTSAnalyzer({
+      rootNames: fileNames,
+    });
+  }
+
+  private createRefreshResult(input: {
+    refreshedFiles: string[];
+    refreshMode: "full" | "incremental";
+    changedFileCount: number;
+    reindexedFileCount: number;
+    reusedFileCount: number;
+  }): RefreshResult {
+    const snapshot = this.requireSnapshot();
     return {
-      snapshot,
-      fileStates,
-      truncated,
+      workspaceId: this.workspaceId,
+      refreshedFiles: input.refreshedFiles,
+      fileCount: snapshot.fileCount,
+      symbolCount: snapshot.symbolCount,
+      edgeCount: snapshot.edgeCount,
+      cacheStatus: this.cacheStatus,
+      refreshMode: input.refreshMode,
+      changedFileCount: input.changedFileCount,
+      reindexedFileCount: input.reindexedFileCount,
+      reusedFileCount: input.reusedFileCount,
     };
+  }
+
+  private setSnapshot(snapshot: WorkspaceSnapshot): void {
+    this.snapshot = snapshot;
+    this.filesByName.clear();
+    this.symbolsByFile.clear();
+    this.outgoingEdgesByFile.clear();
+    this.incomingEdgesByFile.clear();
+
+    for (const file of snapshot.files) {
+      this.filesByName.set(file.fileName, file);
+    }
+
+    for (const symbol of snapshot.symbols) {
+      const symbols = this.symbolsByFile.get(symbol.fileName) ?? [];
+      symbols.push(symbol);
+      this.symbolsByFile.set(symbol.fileName, symbols);
+    }
+
+    for (const edge of snapshot.moduleEdges) {
+      const outgoing = this.outgoingEdgesByFile.get(edge.from) ?? [];
+      outgoing.push(edge);
+      this.outgoingEdgesByFile.set(edge.from, outgoing);
+
+      const incoming = this.incomingEdgesByFile.get(edge.to) ?? [];
+      incoming.push(edge);
+      this.incomingEdgesByFile.set(edge.to, incoming);
+    }
+  }
+
+  private createSymbolRecords(file: FileSummary): SymbolRecord[] {
+    return file.topLevelSymbols.map((symbol) => ({
+      name: symbol.name,
+      kind: symbol.kind,
+      fileName: file.fileName,
+      relativePath: file.relativePath,
+      range: symbol.range,
+      exported: symbol.exported,
+    }));
+  }
+
+  private createModuleEdges(file: FileSummary): ModuleEdge[] {
+    return file.imports
+      .filter((record) => record.resolvedPath !== null)
+      .map((record) => ({
+        from: file.fileName,
+        to: record.resolvedPath as string,
+        kind: record.kind,
+        specifier: record.specifier,
+        symbols: record.importedSymbols,
+      }));
+  }
+
+  private removeIndexedFiles(fileNames: string[]): void {
+    for (const fileName of dedupePaths(fileNames)) {
+      this.filesByName.delete(fileName);
+      this.symbolsByFile.delete(fileName);
+      this.outgoingEdgesByFile.delete(fileName);
+    }
+  }
+
+  private indexFileSummary(fileSummary: FileSummary): void {
+    this.filesByName.set(fileSummary.fileName, fileSummary);
+    this.symbolsByFile.set(fileSummary.fileName, this.createSymbolRecords(fileSummary));
+    this.outgoingEdgesByFile.set(fileSummary.fileName, this.createModuleEdges(fileSummary));
+  }
+
+  private rebuildIncomingEdgesIndex(): void {
+    this.incomingEdgesByFile.clear();
+    for (const outgoingEdges of this.outgoingEdgesByFile.values()) {
+      for (const edge of outgoingEdges) {
+        const incoming = this.incomingEdgesByFile.get(edge.to) ?? [];
+        incoming.push(edge);
+        this.incomingEdgesByFile.set(edge.to, incoming);
+      }
+    }
+  }
+
+  private collectAffectedFiles(changedFiles: readonly string[]): string[] {
+    const queue = [...changedFiles];
+    const visited = new Set<string>();
+
+    while (queue.length > 0) {
+      const current = queue.shift();
+      if (!current || visited.has(current)) {
+        continue;
+      }
+
+      visited.add(current);
+      for (const edge of this.incomingEdgesByFile.get(current) ?? []) {
+        if (!visited.has(edge.from)) {
+          queue.push(edge.from);
+        }
+      }
+    }
+
+    return [...visited].sort((left, right) => left.localeCompare(right));
   }
 
   private createFileSummary(
@@ -648,6 +822,21 @@ export class WorkspaceService {
     }
 
     return analyzer;
+  }
+
+  private getQueryAnalyzer(
+    normalizedFileName: string,
+    overlays: WorkspaceOverlayFile[],
+  ): ArkTSAnalyzer {
+    if (
+      overlays.length === 0 &&
+      this.baseAnalyzer &&
+      this.discoveredFiles.includes(normalizedFileName)
+    ) {
+      return this.baseAnalyzer;
+    }
+
+    return this.createAnalyzer(overlays, [normalizedFileName]);
   }
 
   private async persistSnapshot(): Promise<void> {
@@ -874,6 +1063,62 @@ function areFileStatesEqual(
       other.mtimeMs === fileState.mtimeMs
     );
   });
+}
+
+function diffWorkspaceFileStates(
+  previousStates: WorkspaceFileState[],
+  nextStates: WorkspaceFileState[],
+): RefreshDiff {
+  const previousByFile = new Map(previousStates.map((state) => [state.fileName, state]));
+  const nextByFile = new Map(nextStates.map((state) => [state.fileName, state]));
+  const addedFiles = [...nextByFile.keys()].filter((fileName) => !previousByFile.has(fileName));
+  const removedFiles = [...previousByFile.keys()].filter((fileName) => !nextByFile.has(fileName));
+  const modifiedFiles = [...nextByFile.entries()]
+    .filter(([fileName, nextState]) => {
+      const previousState = previousByFile.get(fileName);
+      return (
+        previousState !== undefined &&
+        (
+          previousState.size !== nextState.size ||
+          previousState.mtimeMs !== nextState.mtimeMs
+        )
+      );
+    })
+    .map(([fileName]) => fileName);
+
+  return {
+    addedFiles: addedFiles.sort((left, right) => left.localeCompare(right)),
+    removedFiles: removedFiles.sort((left, right) => left.localeCompare(right)),
+    modifiedFiles: modifiedFiles.sort((left, right) => left.localeCompare(right)),
+  };
+}
+
+function diffChangedWorkspaceFiles(
+  changedFiles: readonly string[],
+  previousFiles: readonly string[],
+  nextFiles: readonly string[],
+): RefreshDiff {
+  const previousSet = new Set(previousFiles);
+  const nextSet = new Set(nextFiles);
+  const addedFiles: string[] = [];
+  const removedFiles: string[] = [];
+  const modifiedFiles: string[] = [];
+
+  for (const fileName of dedupePaths(changedFiles)) {
+    if (nextSet.has(fileName) && !previousSet.has(fileName)) {
+      addedFiles.push(fileName);
+    } else if (!nextSet.has(fileName) && previousSet.has(fileName)) {
+      removedFiles.push(fileName);
+    } else if (nextSet.has(fileName)) {
+      modifiedFiles.push(fileName);
+    }
+  }
+
+  return {
+    addedFiles,
+    removedFiles,
+    modifiedFiles,
+  };
 }
 
 function extractFileFacts(
